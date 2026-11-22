@@ -2554,9 +2554,9 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             dtype_in_args = any(isinstance(arg, torch.dtype) for arg in args)
             dtype_in_kwargs = "dtype" in kwargs
             if not dtype_in_args and not dtype_in_kwargs:
-                # Accelerate dispatch calls model.to(device) after loading. Device
-                # placement is already handled by the bitsandbytes quantizer.
-                return self
+                # Accelerate dispatch calls model.to(device) after loading.
+                # Move registered buffers as well as ordinary modules.
+                return super().to(*args, **kwargs)
             raise ValueError(
                 "Casting a 4-bit or 8-bit bitsandbytes model with `.to(dtype=...)` is not supported. "
                 "Load the model with `torch_dtype` and use it without `.to()`."
