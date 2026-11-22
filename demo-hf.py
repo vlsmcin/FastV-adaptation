@@ -62,9 +62,12 @@ processor = AutoProcessor.from_pretrained(
 )
 
 raw_image = Image.open(requests.get(image_file, stream=True).raw)
-inputs = processor(prompt, raw_image, return_tensors="pt").to(
+inputs = processor(prompt, raw_image, return_tensors="pt")
+inputs["input_ids"] = inputs["input_ids"].to("cuda:0")
+inputs["attention_mask"] = inputs["attention_mask"].to("cuda:0")
+inputs["pixel_values"] = inputs["pixel_values"].to(
     "cuda:0",
-    torch.float16,
+    dtype=torch.float16,
 )
 
 streamer = TextStreamer(processor)
