@@ -1,359 +1,294 @@
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '7'
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ['GRADIO_TEMP_DIR'] = 'gradio_temp'
-import gradio as gr
-import torch
+"""Interactive Gradio Demo for FastV (compatible with Gradio 4/5/6 & modern transformers)."""
+
+from __future__ import annotations
+
 import argparse
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from llava.conversation import conv_templates, SeparatorStyle
-from llava.model.builder import load_pretrained_model
-from llava.utils import disable_torch_init
-from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
-import requests
-from PIL import Image
-from io import BytesIO
-from transformers import TextStreamer
+import base64
+import inspect
 import os
-import time  
-from datasets import load_from_disk,load_dataset
-import torch
-import json
-from tqdm import tqdm
-import re	
-
-import seaborn as sns
-import matplotlib.pyplot as plt
-import matplotlib.colors as Colormap
-from matplotlib.colors import LogNorm
+import sys
+import time
 import warnings
+from io import BytesIO
+
+import gradio as gr
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+from matplotlib.colors import LogNorm
+from PIL import Image
+
 warnings.filterwarnings("ignore")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("GRADIO_TEMP_DIR", "gradio_temp")
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(REPO_ROOT, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+from FastV.fastv_hf import (
+    FastVConfig,
+    compute_fastv_flops_ratio,
+    load_llava_model,
+    prepare_llava_inputs,
+    resolve_hf_model_id,
+)
 
 
+def visualize_attention(
+    multihead_attention: torch.Tensor,
+    title: str = "Layer 5",
+    image_start: int = 5,
+    image_length: int = 576,
+    sample_style: str = "All layers",
+) -> Image.Image:
+    averaged_attention = torch.mean(multihead_attention.float(), dim=1)[0]
+    pool_size = max(1, min(20, averaged_attention.shape[0] // 2))
+    averaged_attention = (
+        torch.nn.functional.avg_pool2d(
+            averaged_attention.unsqueeze(0).unsqueeze(0), pool_size, stride=pool_size
+        )
+        .squeeze(0)
+        .squeeze(0)
+    )
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import torch
-import seaborn as sns
-from matplotlib.colors import LogNorm
-from io import BytesIO
-from PIL import Image
+    cmap = plt.get_cmap("viridis")
+    fig = plt.figure(figsize=(5, 5), dpi=250)
+    vmax = max(float(averaged_attention.max().item()), 1e-3)
+    vmin = min(0.0007, vmax / 10.0)
+    log_norm = LogNorm(vmin=max(vmin, 1e-6), vmax=vmax)
 
+    ax = sns.heatmap(averaged_attention.numpy(), cmap=cmap, norm=log_norm)
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-import torch
-import seaborn as sns
-from matplotlib.colors import LogNorm
-from io import BytesIO
-from PIL import Image
+    n_bins = averaged_attention.shape[0]
+    ticks = [str(i * pool_size) for i in range(n_bins)]
+    ax.set_xticks(range(n_bins))
+    ax.set_yticks(range(n_bins))
+    ax.set_xticklabels(ticks)
+    ax.set_yticklabels(ticks)
 
+    img_end = image_start + image_length
+    for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+        pos = int(label.get_text())
+        if 0 <= pos < image_start:
+            label.set_color("blue")
+            label.set_fontweight("bold")
+        elif image_start <= pos < img_end:
+            label.set_color("red")
 
-def visualize_attention(multihead_attention,title="Layer 5",sample_style="All layers"):
-    averaged_attention = torch.mean(multihead_attention, axis=1)[0].float()
-    averaged_attention = torch.nn.functional.avg_pool2d(
-        averaged_attention.unsqueeze(0).unsqueeze(0), 20, stride=20).squeeze(0).squeeze(0)
-
-    cmap = plt.cm.get_cmap("viridis")
-
-    plt.figure(figsize=(5, 5),dpi=400)
-    log_norm = LogNorm(vmin=0.0007, vmax=averaged_attention.max())
-
-    ax = sns.heatmap(averaged_attention,
-                     cmap=cmap,
-                     norm=log_norm)
-
-    x_ticks = [str(i*20) for i in range(0,averaged_attention.shape[0])]
-    y_ticks = [str(i*20) for i in range(0,averaged_attention.shape[0])]
-    ax.set_xticks([i for i in range(0,averaged_attention.shape[0])])
-    ax.set_yticks([i for i in range(0,averaged_attention.shape[0])])
-    ax.set_xticklabels(x_ticks)
-    ax.set_yticklabels(y_ticks)
-
-    # label ticks
-    for label in ax.get_xticklabels():
-        tick_location = int(label.get_text())
-        if 0 <= tick_location <= 40:
-            # set the color of the tick labels
-            label.set_color('blue')
-            label.set_fontweight('bold')
-        elif 40 < tick_location <= 600:
-            label.set_color('red')
-
-    for label in ax.get_yticklabels():
-        tick_location = int(label.get_text())
-        if 0 <= tick_location <= 40:
-            # set the color of the tick labels
-            label.set_color('blue')
-            label.set_fontweight('bold')
-        elif 40 < tick_location <= 600:
-            label.set_color('red')
-
-
-    plt.xticks(fontsize=5)
-    plt.yticks(fontsize=5)
-    plt.yticks(rotation=0)
-    plt.xticks(rotation=90)
-
-    plt.title(title, fontsize=20)
+    plt.xticks(fontsize=5, rotation=90)
+    plt.yticks(fontsize=5, rotation=0)
+    plt.title(title, fontsize=16)
 
     buf = BytesIO()
-    plt.savefig(buf,format='png', bbox_inches='tight')
+    plt.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
     image = Image.open(buf).copy()
-    if sample_style == "All layers":
-        image = image.resize((768, 768))
-    else:
-        image = image.resize((1024, 1024))
+    target_size = (768, 768) if sample_style == "All layers" else (1024, 1024)
+    image = image.resize(target_size)
     buf.close()
-    plt.close()
-
+    plt.close(fig)
     return image
 
 
+def select_numbers(n: int, x: int) -> list[int]:
+    if x <= 1:
+        return [0]
+    return [(i * (n - 1)) // (x - 1) for i in range(x)]
 
 
-
-def load_image(image_file):
-    if image_file.startswith('http://') or image_file.startswith('https://'):
-        response = requests.get(image_file)
-        image = Image.open(BytesIO(response.content)).convert('RGB')
-    else:
-        image = Image.open(image_file).convert('RGB')
-    return image
+def pil_to_base64(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
-def concatenate_images(images_list, number_rows=5, number_cols=7):
-    assert len(images_list) == number_rows * number_cols
-
-    # Assuming all images are the same size
-    img_width, img_height = images_list[0].size
-
-    # Creating a blank canvas for the final image
-    final_img = Image.new('RGB', (img_width * number_cols, img_height * number_rows))
-
-    # Loop over the images and paste them onto the canvas
-    for idx, img in enumerate(images_list):
-        row = idx // number_cols  # row index
-        col = idx % number_cols  # column index
-
-        # paste the image at the correct position on the canvas
-        final_img.paste(img, (img_width * col, img_height * row))
-
-    return final_img
-
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Demo")
-    parser.add_argument('--model-path', type=str, required=False, default="./llava-v1.5-7b")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FastV Interactive Demo")
+    parser.add_argument("--model-path", type=str, default=None, help="HF model ID or local path.")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="4bit",
+        choices=["4bit", "8bit", "none"],
+    )
+    parser.add_argument("--port", type=int, default=7862)
+    parser.add_argument("--share", action="store_true", default=False)
     pargs = parser.parse_args()
 
-    examples = [
-        ["figs/example.jpg", "Describe all the objects in the image."],
-        ["figs/example2.jpg","Describe the image in detail."],
-        ["figs/example3.jpg","Describe the animal in image in detail."],
-    ]
-    
-    class InferenceArgs:
-        model_path = pargs.model_path
-        model_base = None
-        image_file = None
-        device = "cuda:0"
-        conv_mode = None
-        temperature = 0.2
-        max_new_tokens = 512
-        load_8bit = False
-        load_4bit = False
-        debug = False
-        image_aspect_ratio = 'pad'
-    args = InferenceArgs()
-    disable_torch_init()
-    print('Loading model...')
-    model_name = get_model_name_from_path(args.model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name, args.load_8bit, args.load_4bit, device=args.device)
-    if 'llama-2' in model_name.lower():
-        conv_mode = "llava_llama_2"
-    elif "v1" in model_name.lower():
-        conv_mode = "llava_v1"
-    elif "mpt" in model_name.lower():
-        conv_mode = "mpt"
-    else:
-        conv_mode = "llava_v0"
+    model_id = resolve_hf_model_id(pargs.model_path)
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    if args.conv_mode is not None and conv_mode != args.conv_mode:
-        print('[WARNING] the auto inferred conversation mode is {}, while `--conv-mode` is {}, using {}'.format(conv_mode, args.conv_mode, args.conv_mode))
-    else:
-        args.conv_mode = conv_mode
+    print(f"Loading model {model_id} (quantization={pargs.quantization})...")
+    model, processor, controller = load_llava_model(
+        model_id=model_id,
+        quantization=pargs.quantization,
+        dtype=dtype,
+        attn_implementation="eager",
+        fastv_config=FastVConfig(use_fastv=False),
+        device_map={"": "cuda:0"} if torch.cuda.is_available() else None,
+    )
 
-    
+    text_cfg = getattr(model.config, "text_config", model.config)
+    total_layers = int(getattr(text_cfg, "num_hidden_layers", 32))
+    hidden_size = int(getattr(text_cfg, "hidden_size", 4096))
+    intermediate_size = int(getattr(text_cfg, "intermediate_size", 11008))
+    device = next(model.parameters()).device
+    image_token_index = int(getattr(model.config, "image_token_index", 32000))
 
-    model.config.use_fast_v = False
-    model.model.reset_fastv()
+    def inference(image_input, prompt, num_of_layers, use_fastv, fastv_k, fastv_r):
+        if image_input is None:
+            return [], "Please upload an image.", ""
+        prompt = prompt or "Describe the image in detail."
 
-    total_layers = model.config.num_hidden_layers
-    
-    image_input = gr.Image(type="pil",label="Image",)
+        inputs, span = prepare_llava_inputs(
+            processor=processor,
+            prompt=prompt,
+            image=image_input,
+            device=device,
+            dtype=dtype,
+            include_system_prompt=True,
+            image_token_index=image_token_index,
+        )
+        img_start, img_len = span if span else (35, 576)
 
-    # attention_Layer = gr.Radio(
-    #     choices=["Every 16 Layers","Beam search","Beam search", "All Layers"],
-    #     value="All Layers",
-    #     label="Text Decoding Method",
-    #     interactive=True,
-    # )
-    attention_Layer = gr.inputs.Dropdown(choices=["All layers", "", "Sample 5 layers", "Sample 10 layers"], default="Sample 3 layers", label="Layer Attention Visualization")
-    
-    gallery = gr.Gallery(
-        label="Generated images", show_label=False, elem_id="gallery"
-    , columns=[5], rows=[7], object_fit="contain", height="auto")
-    
-    prompt_textbox = gr.Textbox(label="Prompt", placeholder="Describe the image in detail.", lines=2)
+        # Step 1: Generate answer with user-selected FastV configuration.
+        controller.update_config(
+            FastVConfig(
+                use_fastv=bool(use_fastv),
+                fastv_k=int(fastv_k),
+                fastv_r=float(fastv_r),
+                mode="inplace",
+            )
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            gen = model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=200,
+                use_cache=True,
+                return_dict_in_generate=True,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        time_cost = time.perf_counter() - t0
+        prompt_len = int(inputs["input_ids"].shape[1])
+        output_text = processor.tokenizer.decode(
+            gen.sequences[0, prompt_len:], skip_special_tokens=True
+        ).strip()
 
-    device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
+        # Step 2: Single forward pass with vanilla model to capture layer attention maps.
+        controller.disable()
+        vis_inputs, _ = prepare_llava_inputs(
+            processor=processor,
+            prompt=prompt,
+            image=image_input,
+            device=device,
+            dtype=dtype,
+            include_system_prompt=True,
+            append_output=" " + output_text,
+            image_token_index=image_token_index,
+        )
+        with torch.inference_mode():
+            fwd = model(**vis_inputs, output_attentions=True, use_cache=False, return_dict=True)
 
-    def temp_inference(prompts,images,append_output=None):
-        outputs = []
-        outputs_attention = []
-        if append_output is None:
-            append_output_str=""
+        if num_of_layers == "All layers":
+            show_layers = list(range(total_layers))
+        elif num_of_layers == "Sample 3 layers":
+            show_layers = select_numbers(total_layers, 3)
+        elif num_of_layers == "Sample 5 layers":
+            show_layers = select_numbers(total_layers, 5)
+        elif num_of_layers == "Sample 10 layers":
+            show_layers = select_numbers(total_layers, 10)
         else:
-            append_output_str=append_output
-        for prompt,image in tqdm(zip(prompts,images),total=len(prompts)):
-            image_tensor = process_images([image], image_processor, args)
-            conv = conv_templates[args.conv_mode].copy()
-            if type(image_tensor) is list:
-                image_tensor = [image.to(model.device, dtype=torch.float16) for image in image_tensor]
-            else:
-                image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+            show_layers = select_numbers(total_layers, 5)
 
-            inp = prompt
-
-            if image is not None:
-                # first message
-                if model.config.mm_use_im_start_end:
-                    inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp # False
-                else:
-                    inp = DEFAULT_IMAGE_TOKEN + '\n' + inp
-                conv.append_message(conv.roles[0], inp)
-                image = None
-            else:
-                # later messages
-                conv.append_message(conv.roles[0], inp)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt() + append_output_str
-
-            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-            stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-            keywords = [stop_str]
-            stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
-            with torch.inference_mode():
-                start = time.time()
-                output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor,
-                    attention_mask=None,
-                    do_sample=False,
-                    max_new_tokens=256,
-                    use_cache=True,
-                    stopping_criteria=[stopping_criteria],
-                    output_attentions=True,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                    )
-                time_cost = time.time() - start
-            
-
-            output = tokenizer.decode(output_ids['sequences'][0, input_ids.shape[1]:],skip_spectial_tokens=True).strip().replace("</s>","")
-            outputs.append(output)
-
-            outputs_attention.append(output_ids['attentions'])
-            if len(outputs) > 1:
-                print(output)
-            if append_output is None:
-                return outputs,outputs_attention,time_cost
-        return outputs,outputs_attention
-
-    def select_numbers(n, x):
-        return [(i*(n-1))//(x-1) for i in range(x)]
-    def inference(image_input, prompt, num_of_layers="All layers"):
-        prompts = [prompt]
-        images = [image_input]
-
-        model_output_ori,outputs_attention,time_cost = temp_inference(prompts,images)
-        # time cost in seconds
-
-        model_output,outputs_attention = temp_inference(prompts,images,append_output=model_output_ori[0])
-        print(model_output_ori)
         images_list = []
-        for i in outputs_attention:
-            if num_of_layers == "All layers":
-                show_layers = list(range(0,total_layers))
-            elif num_of_layers == "Sample 3 layers":
-                show_layers = select_numbers(total_layers,3)
-            elif num_of_layers == "Sample 5 layers":
-                show_layers = select_numbers(total_layers,5)
-            elif num_of_layers == "Sample 10 layers":
-                show_layers = select_numbers(total_layers,10)
-            else:
-                show_layers = list(range(0,total_layers))
-            for j in show_layers:
-                images_list.append(visualize_attention(i[0][j].cpu(),title="Layer "+str(j+1), sample_style=num_of_layers))
-        # final_images = concatenate_images(images_list, number_rows=5, number_cols=7)
-        # return final_images,images_list
-        output = model_output_ori if isinstance(model_output_ori, str) else model_output_ori[0]
-        total_time_cost = "Total Time Cost:{:.2f}s".format(time_cost)
-        return images_list,output,total_time_cost
-
-
-    
-    import base64
-    from io import BytesIO
-    def pil_to_base64(pil_image):
-        pil_image = Image.open(pil_image)
-        buffered = BytesIO()
-        pil_image.save(buffered, format="PNG") 
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
-    fastv_tradeoff = pil_to_base64('figs/fastv_tradeoff.png')
-    attn_map = pil_to_base64('figs/attn_map.png')
-
-    description= f'''# FastV Demo
-Welcome to the demonstration for [FastV](https://arxiv.org/abs/2403.06764), an innovative plug-and-play inference accelerator specifically designed for Large Vision-Language Models. 
-
-FastV enables a **45% reduction in theoretical FLOPs** without compromising on performance by pruning redundant visual tokens in deep layers.
-
-<center><img src="data:image/png;base64,{fastv_tradeoff}" alt="FastV tradeoff image" style="width: 40%;"/></center>
-
-This demo unveils the attention maps of the llava-1.5-7B model to illustrate the inefficient attention phenomena prevalent in Large Vision-Language Models (LVLMs).
-
-The **System Prompt tokens are highlighted in blue**, followed by **Image tokens marked in red**. The remaining tokens are the text tokens marked in black.
-
-## Guidelines:
-
-1. **Upload an image**, **enter a prompt** and **select the number of layers** to visualize the attention maps.
-
-2. The model output with FastV, time cost, and the attention maps for the sampled layers will be displayed.
-
-* **Note**: Due to the Network constraints, the attention map generation may take up to 30 seconds.*
-
-# Dive in, explore and enjoy the capabilities of FastV! 
-
-For more details, visit the [FastV GitHub page](https://github.com/pkunlp-icler/FastV).
-
-'''
-# <img src="data:image/png;base64,{attn_map}" alt="Attention Map image" style="width: 33%;"/>
-     
-
-    demo = gr.Interface(
-                        fn=inference,
-                        inputs=[image_input,prompt_textbox,attention_Layer],
-                        description=description,
-                        outputs=[gallery,"text","text"],
-                        examples=examples,
-                        allow_flagging="never",
+        if fwd.attentions is not None:
+            for layer_idx in show_layers:
+                images_list.append(
+                    visualize_attention(
+                        fwd.attentions[layer_idx].detach().cpu(),
+                        title=f"Layer {layer_idx + 1}",
+                        image_start=img_start,
+                        image_length=img_len,
+                        sample_style=num_of_layers,
                     )
-        
-    demo.launch(share=True,server_name="0.0.0.0", server_port=7862)
+                )
+
+        flops = compute_fastv_flops_ratio(
+            num_layers=total_layers,
+            fastv_k=int(fastv_k),
+            fastv_r=float(fastv_r) if use_fastv else 0.0,
+            n_image_tokens=img_len,
+            n_text_tokens=max(1, prompt_len - img_len),
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        summary = (
+            f"Generation Time: {time_cost:.2f}s | "
+            f"FastV: {'ON' if use_fastv else 'OFF'} (K={int(fastv_k)}, R={float(fastv_r):.0%}) | "
+            f"Theoretical FLOPs Reduction: {flops['flops_reduction_pct']:.1f}%"
+        )
+        return images_list, output_text, summary
+
+    fastv_tradeoff = pil_to_base64(os.path.join(REPO_ROOT, "figs", "fastv_tradeoff.png"))
+    img_banner = (
+        f'<center><img src="data:image/png;base64,{fastv_tradeoff}" alt="FastV tradeoff" style="width: 40%;"/></center>'
+        if fastv_tradeoff
+        else ""
+    )
+
+    description = f"""# FastV Interactive Demo
+Welcome to the modernized demonstration for [FastV](https://arxiv.org/abs/2403.06764) (*An Image is Worth 1/2 Tokens After Layer 2*).
+{img_banner}
+The **System Prompt tokens are highlighted in blue**, **Image tokens in red**, and remaining **Text tokens in black**.
+"""
+
+    examples = [
+        ["figs/example.jpg", "Describe all the objects in the image.", "Sample 5 layers", True, 2, 0.5],
+        ["figs/example2.jpg", "Describe the image in detail.", "Sample 5 layers", True, 2, 0.5],
+        ["figs/example3.jpg", "Describe the animal in image in detail.", "Sample 5 layers", True, 2, 0.5],
+    ]
+
+    interface_kwargs = dict(
+        fn=inference,
+        inputs=[
+            gr.Image(type="pil", label="Image"),
+            gr.Textbox(label="Prompt", placeholder="Describe the image in detail.", lines=2),
+            gr.Dropdown(
+                choices=["Sample 3 layers", "Sample 5 layers", "Sample 10 layers", "All layers"],
+                value="Sample 5 layers",
+                label="Layer Attention Visualization",
+            ),
+            gr.Checkbox(value=True, label="Enable FastV Pruning"),
+            gr.Slider(minimum=0, maximum=total_layers - 1, step=1, value=2, label="FastV Layer K"),
+            gr.Slider(minimum=0.0, maximum=0.9, step=0.05, value=0.5, label="FastV Pruning Ratio R"),
+        ],
+        outputs=[
+            gr.Gallery(label="Attention Maps", columns=5, object_fit="contain", height="auto"),
+            gr.Textbox(label="Model Output"),
+            gr.Textbox(label="Latency & FLOPs Summary"),
+        ],
+        description=description,
+        examples=examples,
+    )
+
+    # Gradio 5/6 uses `flagging_mode="never"` while Gradio 4 uses `allow_flagging="never"`.
+    sig = inspect.signature(gr.Interface.__init__).parameters
+    if "flagging_mode" in sig:
+        interface_kwargs["flagging_mode"] = "never"
+    elif "allow_flagging" in sig:
+        interface_kwargs["allow_flagging"] = "never"
+
+    demo = gr.Interface(**interface_kwargs)
+    demo.launch(share=pargs.share, server_name="0.0.0.0", server_port=pargs.port)
 
 
-
+if __name__ == "__main__":
+    main()
