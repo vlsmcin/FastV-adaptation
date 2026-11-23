@@ -1,4 +1,4 @@
-"""Modern, version-agnostic FastV implementation for HuggingFace LLaVA / Llama models.
+"""Modern, version-agnostic FastV implementation for HuggingFace VLMs (LLaVA & Qwen2-VL ready).
 
 Implements "An Image is Worth 1/2 Tokens After Layer 2: Plug-and-Play Inference
 Acceleration for Large Vision-Language Models" (Chen et al., ECCV 2024 Oral,
@@ -6,32 +6,32 @@ arXiv:2403.06764) using pure PyTorch module hooks so it works directly on
 upstream HuggingFace ``transformers`` (>=4.45 through 5.x) without requiring
 a vendored ``transformers`` fork.
 
-Supported FastV modes:
-  * ``inplace``: Physically drops pruned visual tokens after layer ``K``,
-    reducing sequence length, FLOPs, latency, and KV-cache memory in deeper
-    layers (compatible with both ``use_cache=True`` and ``use_cache=False``).
-  * ``mask``: Masks out pruned visual tokens in the attention mask from layer
-    ``K`` onward without changing sequence length (reproduces the Figure 7 /
-    OCR-VQA ablation study, including the ``K=0`` random baseline).
+Key modular components:
+  * ``scoring.py``: Pluggable visual token scoring registry (``fastv_mean``, etc.).
+  * ``adapters.py``: VLM-specific adapters (``LlavaLlamaAdapter``, ``Qwen2VLAdapter``).
+  * ``FastVController``: Architecture-agnostic hook engine supporting both:
+      - ``mode="inplace"``: Physically drops pruned visual tokens after layer ``K``,
+        reducing sequence length, FLOPs, latency, and KV-cache memory.
+      - ``mode="mask"``: Masks out pruned visual tokens in the attention mask from
+        layer ``K`` onward without changing sequence length (Paper Fig 7 ablation).
 """
 
 from __future__ import annotations
 
 import inspect
-import math
 import os
 import random
 import re
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 try:
     import torch
-    import torch.nn as nn
 except ImportError:  # pragma: no cover - allows pure-Python utilities without torch
     torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
 
+from .adapters import BaseVLMAdapter, LlavaLlamaAdapter, resolve_adapter
+from .scoring import ScorerFn, resolve_scorer
 
 VICUNA_SYSTEM_PROMPT = (
     "A chat between a curious human and an artificial intelligence assistant. "
@@ -50,10 +50,13 @@ class FastVConfig:
     fastv_k: int = 2
     fastv_r: float = 0.5
     mode: str = "inplace"  # "inplace" or "mask"
+    scorer: Union[str, ScorerFn] = "fastv_mean"
+    scorer_kwargs: Dict[str, Any] = field(default_factory=dict)
     image_token_start_index: Optional[int] = None
     image_token_length: Optional[int] = None
     attention_rank: Optional[int] = None  # Explicit number of visual tokens to keep
     random_seed: int = 42
+    force_slice_at_r0: bool = False  # Exercise full slicing path even when keep_n == N_vis (for parity tests)
 
     def __post_init__(self) -> None:
         if self.mode not in ("inplace", "mask"):
@@ -64,6 +67,8 @@ class FastVConfig:
             raise ValueError(f"fastv_r must be in [0.0, 1.0], got {self.fastv_r}")
         if self.attention_rank is not None and self.attention_rank < 0:
             raise ValueError(f"attention_rank must be >= 0, got {self.attention_rank}")
+        # Validate scorer eagerly so invalid names fail fast.
+        resolve_scorer(self.scorer)
 
     @classmethod
     def from_any(cls, cfg: Optional[Union["FastVConfig", Dict[str, Any]]]) -> "FastVConfig":
@@ -73,17 +78,20 @@ class FastVConfig:
             return cfg
         if isinstance(cfg, dict):
             normalized = dict(cfg)
-            # Support legacy naming aliases from original repo scripts.
-            if "use_fast_v" in normalized and "use_fastv" not in normalized:
-                normalized["use_fastv"] = normalized.pop("use_fast_v")
-            if "fast_v_agg_layer" in normalized and "fastv_k" not in normalized:
-                normalized["fastv_k"] = normalized.pop("fast_v_agg_layer")
-            if "fast_v_sys_length" in normalized and "image_token_start_index" not in normalized:
-                normalized["image_token_start_index"] = normalized.pop("fast_v_sys_length")
-            if "fast_v_image_token_length" in normalized and "image_token_length" not in normalized:
-                normalized["image_token_length"] = normalized.pop("fast_v_image_token_length")
-            if "fast_v_attention_rank" in normalized and "attention_rank" not in normalized:
-                normalized["attention_rank"] = normalized.pop("fast_v_attention_rank")
+            # Support legacy naming aliases from original repo scripts & plan.md.
+            aliases = {
+                "use_fast_v": "use_fastv",
+                "enabled": "use_fastv",
+                "fast_v_agg_layer": "fastv_k",
+                "agg_layer": "fastv_k",
+                "prune_ratio": "fastv_r",
+                "fast_v_sys_length": "image_token_start_index",
+                "fast_v_image_token_length": "image_token_length",
+                "fast_v_attention_rank": "attention_rank",
+            }
+            for old_key, new_key in aliases.items():
+                if old_key in normalized and new_key not in normalized:
+                    normalized[new_key] = normalized.pop(old_key)
             if "fast_v_inplace" in normalized and "mode" not in normalized:
                 inplace = normalized.pop("fast_v_inplace")
                 normalized["mode"] = "inplace" if inplace else "mask"
@@ -106,7 +114,10 @@ class FastVConfig:
         return 1.0 - (keep / float(image_token_length))
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if callable(self.scorer):
+            d["scorer"] = getattr(self.scorer, "__name__", repr(self.scorer))
+        return d
 
 
 def compute_fastv_flops_ratio(
@@ -119,16 +130,7 @@ def compute_fastv_flops_ratio(
     intermediate_size: int = 11008,
     swiglu: bool = False,
 ) -> Dict[str, float]:
-    """Compute theoretical FLOPs and FLOPs reduction ratio (Paper Section 3.3, Eq. 1-2).
-
-    Paper Equation (1):
-        FLOPs_layer(n) = 4 * n * d^2 + 2 * n^2 * d + 2 * n * d * m
-    (Set ``swiglu=True`` to use ``3 * n * d * m`` for Llama's gated SwiGLU MLP.)
-
-    Paper Equation (2):
-        FLOPs_FastV = K * FLOPs_layer(n) + (T - K) * FLOPs_layer(n_hat)
-        where n_hat = (1 - R) * n_image_tokens + n_text_tokens.
-    """
+    """Compute theoretical FLOPs and FLOPs reduction ratio (Paper Section 3.3, Eq. 1-2)."""
     if num_layers <= 0:
         raise ValueError("num_layers must be positive")
     k_eff = max(0, min(int(fastv_k), num_layers))
@@ -162,25 +164,22 @@ def compute_fastv_flops_ratio(
     }
 
 
-def detect_image_token_span(
+def detect_visual_token_indices(
     input_ids: Any,
-    image_token_index: int = 32000,
+    visual_token_ids: Union[int, Sequence[int]] = 32000,
     default_image_length: int = 576,
-) -> Optional[Tuple[int, int]]:
-    """Detect ``(start_index, length)`` of the visual token span in ``input_ids``.
+) -> Optional[List[int]]:
+    """Detect all visual token positions in ``input_ids`` (supports non-contiguous multi-image).
 
-    Supports both:
-      * Modern ``transformers`` (>=4.45) where ``LlavaProcessor`` expands
-        ``<image>`` into ``default_image_length`` contiguous ``image_token_index``
-        entries directly inside ``input_ids``.
-      * Older ``transformers`` (<4.45) where a single ``image_token_index``
-        placeholder is expanded inside ``LlavaForConditionalGeneration.forward``.
+    Supports:
+      * Modern ``transformers`` (>=4.45) LLaVA and Qwen2-VL where visual tokens are
+        already expanded inside ``input_ids`` (including interleaved multi-image prompts).
+      * Older ``transformers`` (<4.45) where a single placeholder token is expanded
+        to ``default_image_length`` tokens inside ``forward()``.
     """
     if input_ids is None:
         return None
-    ids = input_ids
-    if hasattr(ids, "detach"):
-        ids = ids.detach()
+    ids = input_ids.detach() if hasattr(input_ids, "detach") else input_ids
     if hasattr(ids, "ndim") and ids.ndim == 2:
         row = ids[0]
     elif hasattr(ids, "ndim") and ids.ndim == 1:
@@ -190,18 +189,35 @@ def detect_image_token_span(
     else:
         return None
 
-    if hasattr(row, "tolist"):
-        tokens = row.tolist()
-    else:
-        tokens = list(row)
-
-    positions = [idx for idx, tok in enumerate(tokens) if int(tok) == int(image_token_index)]
+    tokens = row.tolist() if hasattr(row, "tolist") else list(row)
+    target_set = (
+        {int(visual_token_ids)}
+        if isinstance(visual_token_ids, int)
+        else {int(t) for t in visual_token_ids}
+    )
+    positions = [idx for idx, tok in enumerate(tokens) if int(tok) in target_set]
     if not positions:
         return None
-    start = positions[0]
-    if len(positions) == 1:
-        return (start, default_image_length)
-    return (start, len(positions))
+    if len(positions) == 1 and default_image_length > 1:
+        start = positions[0]
+        return list(range(start, start + int(default_image_length)))
+    return positions
+
+
+def detect_image_token_span(
+    input_ids: Any,
+    image_token_index: int = 32000,
+    default_image_length: int = 576,
+) -> Optional[Tuple[int, int]]:
+    """Detect ``(start_index, length)`` for single-image prompts (backwards-compatible helper)."""
+    indices = detect_visual_token_indices(
+        input_ids=input_ids,
+        visual_token_ids=image_token_index,
+        default_image_length=default_image_length,
+    )
+    if not indices:
+        return None
+    return (indices[0], len(indices))
 
 
 def resolve_hf_model_id(
@@ -215,7 +231,6 @@ def resolve_hf_model_id(
             return model_path
         lower = model_path.lower().rstrip("/")
         if "/" in model_path and not model_path.startswith(".") and not model_path.startswith("/"):
-            # Looks like an explicit HuggingFace repo ID (e.g., llava-hf/llava-1.5-7b-hf)
             return model_path
         if "13b" in lower:
             return DEFAULT_HF_MODEL_13B
@@ -237,45 +252,13 @@ def resolve_hf_model_id(
 
 
 def get_llama_backbone(model: Any) -> Any:
-    """Locate the underlying ``LlamaModel`` (holding ``.layers``) across transformers versions.
-
-    Works for:
-      * ``transformers >= 4.50 / 5.x``: ``model.model.language_model``
-      * ``transformers 4.39 - 4.49``: ``model.language_model.model``
-      * Standalone ``LlamaForCausalLM``: ``model.model``
-      * Bare ``LlamaModel``: ``model``
-    """
-    candidates = [
-        getattr(getattr(model, "model", None), "language_model", None),
-        getattr(getattr(model, "language_model", None), "model", None),
-        getattr(model, "language_model", None),
-        getattr(model, "model", None),
-        model,
-    ]
-    for cand in candidates:
-        if cand is not None and hasattr(cand, "layers") and len(cand.layers) > 0:
-            return cand
-    raise AttributeError(
-        f"Could not find a transformer decoder backbone with `.layers` on {type(model).__name__}"
-    )
-
-
-def _infer_default_image_token_length(model: Any) -> int:
-    cfg = getattr(model, "config", None)
-    vision_cfg = getattr(cfg, "vision_config", None)
-    if vision_cfg is not None:
-        img_size = getattr(vision_cfg, "image_size", None)
-        patch_size = getattr(vision_cfg, "patch_size", None)
-        if img_size and patch_size:
-            patches = (int(img_size) // int(patch_size)) ** 2
-            strategy = getattr(cfg, "vision_feature_select_strategy", "default")
-            return patches + 1 if strategy == "full" else patches
-    return 576
+    """Locate the underlying decoder backbone (holding ``.layers``) across transformers versions."""
+    return resolve_adapter(model).get_decoder_backbone(model)
 
 
 def _set_eager_attention(model: Any, backbone: Any) -> None:
     """Ensure eager attention is active so layer K-1 materializes attention weights."""
-    current = getattr(backbone.config, "_attn_implementation", None)
+    current = getattr(getattr(backbone, "config", None), "_attn_implementation", None)
     if current == "eager":
         return
     if hasattr(model, "set_attn_implementation"):
@@ -309,23 +292,28 @@ def _make_causal_additive_mask(
     if seq_len == 1:
         return torch.zeros((batch_size, 1, 1, kv_len), dtype=dtype, device=device)
     mask = torch.full((seq_len, kv_len), min_val, dtype=dtype, device=device)
-    # Causal upper-triangular masking aligned to the right for kv_len >= seq_len.
     diag = kv_len - seq_len + 1
     mask = torch.triu(mask, diagonal=diag)
     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, kv_len).clone()
 
 
 class FastVController:
-    """Manages PyTorch hooks that execute FastV pruning on a HuggingFace LLaVA/Llama model."""
+    """Architecture-agnostic PyTorch hook engine executing FastV pruning on HF VLMs."""
 
-    def __init__(self, model: Any, config: Optional[Union[FastVConfig, Dict[str, Any]]] = None):
+    def __init__(
+        self,
+        model: Any,
+        config: Optional[Union[FastVConfig, Dict[str, Any]]] = None,
+        adapter: Optional[BaseVLMAdapter] = None,
+    ):
         if torch is None:
             raise RuntimeError("PyTorch is required to use FastVController.")
         self.model = model
-        self.backbone = get_llama_backbone(model)
+        self.adapter = resolve_adapter(model, adapter=adapter)
+        self.backbone = self.adapter.get_decoder_backbone(model)
         self.config = FastVConfig.from_any(config)
-        self.default_image_length = _infer_default_image_token_length(model)
-        self.image_token_index = int(getattr(getattr(model, "config", None), "image_token_index", 32000))
+        self.visual_token_ids = self.adapter.get_visual_token_ids(model)
+        self.default_image_length = self.adapter.get_default_image_length(model)
 
         self._handles: List[Any] = []
         self._reset_generation_state()
@@ -334,7 +322,7 @@ class FastVController:
             _set_eager_attention(self.model, self.backbone)
 
     def _reset_generation_state(self) -> None:
-        self._detected_image_span: Optional[Tuple[int, int]] = None
+        self._detected_vis_indices: Optional[List[int]] = None
         self._last_prefill_keep_indices: Optional[Any] = None
         self._last_prefill_drop_indices: Optional[Any] = None
         self._last_prefill_orig_len: Optional[int] = None
@@ -364,23 +352,24 @@ class FastVController:
         self._handles.clear()
         self._reset_generation_state()
 
-    def _resolve_image_span(self, seq_len: int) -> Optional[Tuple[int, int]]:
+    def _resolve_vis_indices(self, seq_len: int, device: Any) -> Optional[Any]:
+        """Resolve 1D sorted LongTensor of visual token positions within ``[0, seq_len)``."""
         start = self.config.image_token_start_index
         length = self.config.image_token_length
-        if start is None or length is None:
-            if self._detected_image_span is not None:
-                det_start, det_len = self._detected_image_span
-                if start is None:
-                    start = det_start
-                if length is None:
-                    length = det_len
-        if start is None:
-            return None
-        if length is None:
-            length = self.default_image_length
-        if start < 0 or length <= 0 or start + length > seq_len:
-            return None
-        return (int(start), int(length))
+        if start is not None:
+            eff_len = int(length) if length is not None else self.default_image_length
+            if start < 0 or eff_len <= 0 or start + eff_len > seq_len:
+                return None
+            return torch.arange(start, start + eff_len, dtype=torch.long, device=device)
+
+        if self._detected_vis_indices is not None:
+            valid = [i for i in self._detected_vis_indices if 0 <= i < seq_len]
+            if not valid:
+                return None
+            if length is not None and length < len(valid):
+                valid = valid[: int(length)]
+            return torch.tensor(valid, dtype=torch.long, device=device)
+        return None
 
     def _select_keep_and_drop_indices(
         self,
@@ -388,35 +377,35 @@ class FastVController:
         device: Any,
         attn_weights: Optional[Any],
     ) -> Optional[Tuple[Any, Any]]:
-        span = self._resolve_image_span(seq_len)
-        if span is None:
-            return None
-        img_start, img_len = span
-        keep_n = self.config.resolve_keep_count(img_len)
-        if keep_n >= img_len:
+        vis_indices = self._resolve_vis_indices(seq_len=seq_len, device=device)
+        if vis_indices is None or vis_indices.numel() == 0:
             return None
 
-        if self.config.fastv_k == 0 or attn_weights is None:
-            # Random visual token selection (reproduces K=0 baseline in Paper Figure 7)
+        n_vis = int(vis_indices.numel())
+        keep_n = self.config.resolve_keep_count(n_vis)
+        if keep_n >= n_vis and not self.config.force_slice_at_r0:
+            return None
+
+        if keep_n >= n_vis:
+            kept_vis_indices = vis_indices
+        elif self.config.fastv_k == 0 or attn_weights is None:
             rng = random.Random(self.config.random_seed)
-            rel_indices = sorted(rng.sample(range(img_len), keep_n)) if keep_n > 0 else []
-            top_img_indices = torch.tensor(
-                [img_start + i for i in rel_indices], dtype=torch.long, device=device
-            )
+            rel = sorted(rng.sample(range(n_vis), keep_n)) if keep_n > 0 else []
+            kept_vis_indices = vis_indices[torch.tensor(rel, dtype=torch.long, device=device)] if rel else torch.empty(0, dtype=torch.long, device=device)
         else:
-            # Average attention over heads for sample 0, take last token's attention over image tokens.
-            # attn_weights shape: (batch, num_heads, q_len, kv_len)
-            last_layer_attn_avg = attn_weights.mean(dim=1)[0]
-            last_tok_attn = last_layer_attn_avg[-1]
-            img_attn = last_tok_attn[img_start : img_start + img_len]
+            scorer_fn = resolve_scorer(self.config.scorer)
+            scores = scorer_fn(attn_weights, vis_indices, **self.config.scorer_kwargs)
             if keep_n > 0:
-                top_img_indices = img_attn.topk(keep_n).indices + img_start
+                top_rel = scores.topk(keep_n).indices.to(vis_indices.device)
+                kept_vis_indices = vis_indices.index_select(0, top_rel)
             else:
-                top_img_indices = torch.empty(0, dtype=torch.long, device=device)
+                kept_vis_indices = torch.empty(0, dtype=torch.long, device=device)
 
-        prefix = torch.arange(0, img_start, dtype=torch.long, device=device)
-        suffix = torch.arange(img_start + img_len, seq_len, dtype=torch.long, device=device)
-        keep_indices = torch.cat([prefix, top_img_indices.to(device=device, dtype=torch.long), suffix])
+        vis_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+        vis_mask[vis_indices] = True
+        non_vis_indices = torch.nonzero(~vis_mask, as_tuple=False).squeeze(-1)
+
+        keep_indices = torch.cat([non_vis_indices, kept_vis_indices.to(device=device, dtype=torch.long)])
         keep_indices = keep_indices.sort().values
 
         keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
@@ -424,13 +413,19 @@ class FastVController:
         drop_indices = torch.nonzero(~keep_mask, as_tuple=False).squeeze(-1)
 
         self.last_stats = {
+            "adapter": self.adapter.name,
+            "scorer": (
+                self.config.scorer
+                if isinstance(self.config.scorer, str)
+                else getattr(self.config.scorer, "__name__", "custom")
+            ),
             "mode": self.config.mode,
             "fastv_k": self.config.fastv_k,
-            "fastv_r": self.config.effective_pruning_ratio(img_len),
-            "image_token_start_index": img_start,
-            "image_token_length": img_len,
-            "kept_image_tokens": int(keep_n),
-            "dropped_image_tokens": int(img_len - keep_n),
+            "fastv_r": self.config.effective_pruning_ratio(n_vis),
+            "image_token_start_index": int(vis_indices[0].item()),
+            "image_token_length": n_vis,
+            "kept_image_tokens": int(kept_vis_indices.numel()),
+            "dropped_image_tokens": int(n_vis - kept_vis_indices.numel()),
             "orig_seq_len": int(seq_len),
             "pruned_seq_len": int(keep_indices.shape[0]),
         }
@@ -504,7 +499,7 @@ class FastVController:
         return mask
 
     def _install_hooks(self) -> None:
-        # 1. Top-level pre-hook to detect image token span from input_ids on prefill.
+        # 1. Top-level pre-hook to detect all visual token indices from input_ids on prefill.
         def _top_pre_hook(_module: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
             input_ids = kwargs.get("input_ids")
             if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]) and args[0].dtype in (
@@ -513,13 +508,13 @@ class FastVController:
             ):
                 input_ids = args[0]
             if input_ids is not None and hasattr(input_ids, "shape") and input_ids.shape[-1] > 1:
-                span = detect_image_token_span(
+                indices = detect_visual_token_indices(
                     input_ids,
-                    image_token_index=self.image_token_index,
+                    visual_token_ids=self.visual_token_ids,
                     default_image_length=self.default_image_length,
                 )
-                if span is not None:
-                    self._detected_image_span = span
+                if indices is not None:
+                    self._detected_vis_indices = indices
 
         self._handles.append(self.model.register_forward_pre_hook(_top_pre_hook, with_kwargs=True))
 
@@ -530,7 +525,6 @@ class FastVController:
             self._step_drop_indices = None
             self._step_orig_len = None
 
-            # Determine if this is a fresh prefill (seq_len > 1) vs single-token decode (seq_len == 1).
             inputs_embeds = kwargs.get("inputs_embeds")
             input_ids = kwargs.get("input_ids")
             if input_ids is None and len(args) > 0 and torch.is_tensor(args[0]):
@@ -551,7 +545,7 @@ class FastVController:
 
         # 3. Per-layer attention capture & pruning hooks.
         for layer_idx, decoder_layer in enumerate(self.backbone.layers):
-            self_attn = getattr(decoder_layer, "self_attn", None)
+            self_attn = self.adapter.get_layer_attention_module(decoder_layer)
             if self_attn is not None:
                 attn_sig_params = set(inspect.signature(self_attn.forward).parameters.keys())
                 has_output_attentions_arg = "output_attentions" in attn_sig_params
@@ -603,7 +597,6 @@ class FastVController:
                     if idx < k:
                         return None
 
-                    # Extract hidden_states (positional arg 0 or kwarg)
                     hs_in_args = len(args) > 0 and torch.is_tensor(args[0])
                     hidden_states = args[0] if hs_in_args else kwargs.get("hidden_states")
                     if hidden_states is None:
@@ -622,7 +615,6 @@ class FastVController:
                                 device=device,
                                 attn_weights=self._step_captured_attn,
                             )
-                            # Release captured attention tensor immediately to save VRAM.
                             self._step_captured_attn = None
                             if selection is None:
                                 return None
@@ -643,7 +635,6 @@ class FastVController:
 
                         if self.config.mode == "inplace":
                             new_seq_len = int(keep_indices.shape[0])
-                            # Only slice hidden_states at layer K (subsequent layers already receive pruned hidden_states).
                             if idx == k and cur_seq_len == orig_len:
                                 pruned_hs = hidden_states.index_select(1, keep_indices.to(device))
                                 if hs_in_args:
@@ -651,33 +642,21 @@ class FastVController:
                                 else:
                                     new_kwargs["hidden_states"] = pruned_hs
 
-                            # Slice position_ids if still at original prefill length.
-                            pos_ids = new_kwargs.get("position_ids")
-                            if pos_ids is not None and torch.is_tensor(pos_ids) and pos_ids.shape[-1] == orig_len:
-                                new_kwargs["position_ids"] = pos_ids.index_select(-1, keep_indices.to(pos_ids.device))
-
-                            # Slice precomputed RoPE position_embeddings=(cos, sin) (transformers >= 4.45 / 5.x).
-                            pos_emb = new_kwargs.get("position_embeddings")
-                            if (
-                                isinstance(pos_emb, tuple)
-                                and len(pos_emb) == 2
-                                and torch.is_tensor(pos_emb[0])
-                                and pos_emb[0].shape[1] == orig_len
-                            ):
-                                cos, sin = pos_emb
-                                k_dev = keep_indices.to(cos.device)
-                                new_kwargs["position_embeddings"] = (
-                                    cos.index_select(1, k_dev),
-                                    sin.index_select(1, k_dev),
+                            # Delegate RoPE & position_ids slicing to adapter (supports 2D Llama & 3D Qwen2-VL M-RoPE).
+                            if "position_ids" in new_kwargs and new_kwargs["position_ids"] is not None:
+                                new_kwargs["position_ids"] = self.adapter.slice_position_ids(
+                                    new_kwargs["position_ids"], keep_indices, orig_len
+                                )
+                            if "position_embeddings" in new_kwargs and new_kwargs["position_embeddings"] is not None:
+                                new_kwargs["position_embeddings"] = self.adapter.slice_position_embeddings(
+                                    new_kwargs["position_embeddings"], keep_indices, orig_len
                                 )
 
-                            # Slice causal attention mask.
                             if "attention_mask" in new_kwargs and new_kwargs["attention_mask"] is not None:
                                 new_kwargs["attention_mask"] = self._slice_attention_mask_prefill(
                                     new_kwargs["attention_mask"], keep_indices, orig_len
                                 )
 
-                            # Slice cache_position.
                             cache_pos = new_kwargs.get("cache_position")
                             if cache_pos is not None and torch.is_tensor(cache_pos) and cache_pos.shape[0] == orig_len:
                                 new_kwargs["cache_position"] = cache_pos[:new_seq_len]
@@ -706,7 +685,6 @@ class FastVController:
                                 )
                             return args, new_kwargs
                         else:
-                            # Determine KV cache length for mask mode during decode.
                             attn_mask = new_kwargs.get("attention_mask")
                             kv_len = None
                             if torch.is_tensor(attn_mask):
@@ -742,13 +720,16 @@ class FastVController:
 def attach_fastv(
     model: Any,
     fastv_config: Optional[Union[FastVConfig, Dict[str, Any]]] = None,
+    adapter: Optional[BaseVLMAdapter] = None,
 ) -> FastVController:
-    """Attach (or update) a ``FastVController`` on a HuggingFace LLaVA/Llama model."""
+    """Attach (or update) a ``FastVController`` on a HuggingFace VLM/LLM."""
     existing = getattr(model, "_fastv_controller", None)
-    if isinstance(existing, FastVController):
+    if isinstance(existing, FastVController) and adapter is None:
         existing.update_config(fastv_config)
         return existing
-    controller = FastVController(model, fastv_config)
+    if isinstance(existing, FastVController):
+        existing.remove()
+    controller = FastVController(model, fastv_config, adapter=adapter)
     model._fastv_controller = controller
     return controller
 
@@ -766,6 +747,14 @@ def disable_fastv(model: Any) -> None:
     existing = getattr(model, "_fastv_controller", None)
     if isinstance(existing, FastVController):
         existing.disable()
+
+
+def remove_fastv(model: Any) -> None:
+    """Completely detach all FastV hooks from ``model``."""
+    existing = getattr(model, "_fastv_controller", None)
+    if isinstance(existing, FastVController):
+        existing.remove()
+        delattr(model, "_fastv_controller")
 
 
 def load_llava_model(
@@ -812,7 +801,6 @@ def load_llava_model(
     elif torch.cuda.is_available():
         load_kwargs["device_map"] = device_map if device_map is not None else {"": "cuda:0"}
 
-    # Handle transformers 5.x (`dtype=`) vs 4.x (`torch_dtype=`) cleanly without warnings/errors.
     import transformers
 
     tf_ver = tuple(int(p) for p in re.findall(r"\d+", transformers.__version__)[:2])
@@ -824,7 +812,6 @@ def load_llava_model(
     try:
         model = LlavaForConditionalGeneration.from_pretrained(resolved_id, **load_kwargs)
     except TypeError:
-        # Fallback if a custom version expects the opposite dtype kwarg name.
         if "dtype" in load_kwargs:
             load_kwargs["torch_dtype"] = load_kwargs.pop("dtype")
         else:
@@ -892,16 +879,7 @@ def compute_layer_attention_efficiency(
     image_length: int,
     instruction_end: Optional[int] = None,
 ) -> Dict[str, List[float]]:
-    """Compute per-layer attention allocation by token type (Paper Section 2, Figure 3).
-
-    For each layer, averages the attention weights across all heads, then computes
-    the mean attention received per token (and total attention share) for:
-      * system prompt tokens: ``[0, image_start)``
-      * visual / image tokens: ``[image_start, image_start + image_length)``
-      * instruction / text tokens: ``[image_start + image_length, instruction_end)``
-      * output tokens (if ``instruction_end < seq_len``): ``[instruction_end, seq_len)``
-    evaluated from the perspective of the final prompt / generated tokens.
-    """
+    """Compute per-layer attention allocation by token type (Paper Section 2, Figure 3)."""
     metrics: Dict[str, List[float]] = {
         "layer": [],
         "system_total": [],
@@ -919,19 +897,17 @@ def compute_layer_attention_efficiency(
     for idx, layer_attn in enumerate(attentions):
         if layer_attn is None:
             continue
-        # Shape: (batch, heads, seq_len, seq_len) -> (seq_len, seq_len)
         avg = layer_attn.float().mean(dim=1)[0]
         seq_len = int(avg.shape[-1])
         inst_end = min(instruction_end if instruction_end is not None else seq_len, seq_len)
 
-        # Evaluate attention from output tokens (if present) else from the last prompt token.
         if inst_end < seq_len:
             query_attn = avg[inst_end:, :].mean(dim=0)
         else:
             query_attn = avg[-1, :]
 
         sys_slice = query_attn[:image_start]
-        img_slice = query_attn[image_start:min(img_end, seq_len)]
+        img_slice = query_attn[image_start : min(img_end, seq_len)]
         txt_slice = query_attn[min(img_end, seq_len) : inst_end]
         out_slice = query_attn[inst_end:]
 
@@ -945,7 +921,6 @@ def compute_layer_attention_efficiency(
         txt_pt = txt_tot / max(1, txt_slice.numel())
         out_pt = out_tot / max(1, out_slice.numel()) if out_slice.numel() > 0 else 0.0
 
-        # Attention efficiency = (image attention share) / (image token fraction)
         img_token_frac = img_slice.numel() / max(1, seq_len)
         vis_eff = img_tot / img_token_frac if img_token_frac > 0 else 0.0
 
@@ -983,11 +958,7 @@ def compute_rouge_l(
     predictions: Sequence[str],
     beta: float = 1.2,
 ) -> Tuple[float, List[float]]:
-    """Compute ROUGE-L matching ``pycocoevalcap.rouge.rouge.Rouge`` (beta=1.2) in pure Python.
-
-    Avoids fragile native/Java dependencies on Python 3.12/3.13 while producing
-    identical scores to ``pycocoevalcap``'s ROUGE-L implementation.
-    """
+    """Compute ROUGE-L matching ``pycocoevalcap.rouge.rouge.Rouge`` (beta=1.2) in pure Python."""
     if len(references) != len(predictions):
         raise ValueError("references and predictions must have the same length")
     scores: List[float] = []

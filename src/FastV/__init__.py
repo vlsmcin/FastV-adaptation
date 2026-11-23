@@ -1,5 +1,13 @@
 """FastV: Plug-and-Play Inference Acceleration for Large Vision-Language Models."""
 
+from .adapters import (
+    ADAPTERS,
+    BaseVLMAdapter,
+    LlavaLlamaAdapter,
+    Qwen2VLAdapter,
+    register_adapter,
+    resolve_adapter,
+)
 from .fastv_hf import (
     FastVConfig,
     FastVController,
@@ -8,26 +16,50 @@ from .fastv_hf import (
     compute_layer_attention_efficiency,
     compute_rouge_l,
     detect_image_token_span,
+    detect_visual_token_indices,
     disable_fastv,
     get_llama_backbone,
     load_llava_model,
     prepare_llava_inputs,
+    remove_fastv,
     resolve_hf_model_id,
     set_fastv_config,
 )
+from .scoring import (
+    SCORERS,
+    fastv_max_head_scorer,
+    fastv_mean_scorer,
+    fastv_mean_std_scorer,
+    register_scorer,
+    resolve_scorer,
+)
 
 __all__ = [
+    "ADAPTERS",
+    "BaseVLMAdapter",
     "FastVConfig",
     "FastVController",
+    "LlavaLlamaAdapter",
+    "Qwen2VLAdapter",
+    "SCORERS",
     "attach_fastv",
     "compute_fastv_flops_ratio",
     "compute_layer_attention_efficiency",
     "compute_rouge_l",
     "detect_image_token_span",
+    "detect_visual_token_indices",
     "disable_fastv",
+    "fastv_max_head_scorer",
+    "fastv_mean_scorer",
+    "fastv_mean_std_scorer",
     "get_llama_backbone",
     "load_llava_model",
     "prepare_llava_inputs",
+    "register_adapter",
+    "register_scorer",
+    "remove_fastv",
+    "resolve_adapter",
     "resolve_hf_model_id",
+    "resolve_scorer",
     "set_fastv_config",
 ]

@@ -140,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         choices=["inplace", "mask"],
         help="FastV pruning mode (default: inplace).",
     )
+    parser.add_argument(
+        "--scorer",
+        type=str,
+        default="fastv_mean",
+        help="Visual token importance scorer from FastV.scoring.SCORERS (default: fastv_mean).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--min-new-tokens", type=int, default=200)
     parser.add_argument(
@@ -178,6 +184,7 @@ def main() -> None:
         fastv_k=args.fastv_k,
         fastv_r=args.fastv_r,
         mode=args.mode,
+        scorer=args.scorer,
     )
 
     print(f"Loading model: {model_id} (quantization={args.quantization}, GPU={gpu_memory_gib:.2f} GiB)")

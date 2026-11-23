@@ -151,6 +151,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-v-r", type=float, default=None, help="Pruning ratio R in [0, 1].")
     parser.add_argument("--fast-v-agg-layer", type=int, default=2, help="Pruning layer K (supports K=0 for random).")
     parser.add_argument(
+        "--scorer",
+        type=str,
+        default="fastv_mean",
+        help="Visual token importance scorer from FastV.scoring.SCORERS (default: fastv_mean).",
+    )
+    parser.add_argument(
+        "--include-system-prompt",
+        default=False,
+        action="store_true",
+        help="Prepend legacy Vicuna v1 system prompt (default: False, matching llava-hf format).",
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=os.environ.get("FASTV_QUANTIZATION", "4bit"),
@@ -184,6 +196,7 @@ def main() -> None:
             fastv_k=pargs.fast_v_agg_layer,
             fastv_r=pargs.fast_v_r if pargs.fast_v_r is not None else 0.5,
             mode=pargs.fast_v_mode,
+            scorer=pargs.scorer,
             image_token_start_index=pargs.fast_v_sys_length,
             image_token_length=pargs.fast_v_image_token_length,
             attention_rank=pargs.fast_v_attention_rank,
@@ -219,7 +232,7 @@ def main() -> None:
             image=image,
             device=device,
             dtype=dtype,
-            include_system_prompt=True,
+            include_system_prompt=pargs.include_system_prompt,
             image_token_index=image_token_index,
         )
         prompt_len = int(inputs["input_ids"].shape[1])
