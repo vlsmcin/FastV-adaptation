@@ -247,24 +247,38 @@ def get_llama_backbone(model: Any) -> Any:
     return resolve_adapter(model).get_decoder_backbone(model)
 
 
+def _supports_dynamic_eager_dispatch(self_attn: Any) -> bool:
+    """Return True if ``self_attn`` uses unified config-driven dispatch (transformers >= 4.49 / 5.x)."""
+    if self_attn is None:
+        return False
+    cls_name = type(self_attn).__name__.lower()
+    if "sdpa" in cls_name or "flash" in cls_name:
+        return False
+    cfg = getattr(self_attn, "config", None)
+    return cfg is not None and hasattr(cfg, "_attn_implementation")
+
+
 def _set_eager_attention(model: Any, backbone: Any) -> None:
-    """Ensure eager attention is active so layer K-1 materializes attention weights."""
+    """Ensure eager attention is active on the text decoder ``backbone`` without touching ``model.visual``."""
     current = getattr(getattr(backbone, "config", None), "_attn_implementation", None)
     if current == "eager":
         return
-    if hasattr(model, "set_attn_implementation"):
+    if hasattr(backbone, "set_attn_implementation"):
         try:
-            model.set_attn_implementation("eager")
+            backbone.set_attn_implementation("eager")
             return
         except Exception:
             pass
-    for obj in (model, backbone):
-        cfg = getattr(obj, "config", None)
-        if cfg is not None:
-            cfg._attn_implementation = "eager"
-            text_cfg = getattr(cfg, "text_config", None)
-            if text_cfg is not None:
-                text_cfg._attn_implementation = "eager"
+    backbone_cfg = getattr(backbone, "config", None)
+    if backbone_cfg is not None:
+        backbone_cfg._attn_implementation = "eager"
+    model_cfg = getattr(model, "config", None)
+    if model_cfg is not None:
+        text_cfg = getattr(model_cfg, "text_config", None)
+        if text_cfg is not None:
+            text_cfg._attn_implementation = "eager"
+        elif not hasattr(model, "visual") and not hasattr(getattr(model, "model", None), "visual"):
+            model_cfg._attn_implementation = "eager"
     for layer in backbone.layers:
         attn = getattr(layer, "self_attn", None)
         if attn is not None and hasattr(attn, "config"):
@@ -307,12 +321,35 @@ class FastVController:
         self.default_image_length = self.adapter.get_default_image_length(model)
 
         self._handles: List[Any] = []
+        self._step_prev_attn_impl: Optional[Tuple[Any, Any]] = None
         self._reset_generation_state()
         self._install_hooks()
-        if self.config.use_fastv and self.config.fastv_k > 0:
-            _set_eager_attention(self.model, self.backbone)
+        self._ensure_attention_capture_ready()
+
+    def _restore_temp_attn_impl(self) -> None:
+        if self._step_prev_attn_impl is not None:
+            attn_cfg, prev_impl = self._step_prev_attn_impl
+            self._step_prev_attn_impl = None
+            try:
+                attn_cfg._attn_implementation = prev_impl
+            except Exception:
+                pass
+
+    def _ensure_attention_capture_ready(self) -> None:
+        """Ensure layer K-1 can materialize attention weights without disturbing ``model.visual``."""
+        if not (self.config.use_fastv and self.config.fastv_k > 0):
+            return
+        target_idx = self.config.fastv_k - 1
+        if 0 <= target_idx < len(self.backbone.layers):
+            target_attn = self.adapter.get_layer_attention_module(self.backbone.layers[target_idx])
+            if _supports_dynamic_eager_dispatch(target_attn):
+                # Unified attention class (transformers >= 4.49 / 5.x): _attn_pre_hook / _attn_post_hook
+                # toggle eager dynamically ONLY on layer K-1 during prefill, keeping all other layers & vision on SDPA.
+                return
+        _set_eager_attention(self.model, self.backbone)
 
     def _reset_generation_state(self) -> None:
+        self._restore_temp_attn_impl()
         self._detected_vis_indices: Optional[List[int]] = None
         self._last_prefill_keep_indices: Optional[Any] = None
         self._last_prefill_drop_indices: Optional[Any] = None
@@ -326,8 +363,7 @@ class FastVController:
     def update_config(self, config: Optional[Union[FastVConfig, Dict[str, Any]]]) -> "FastVController":
         self.config = FastVConfig.from_any(config)
         self._reset_generation_state()
-        if self.config.use_fastv and self.config.fastv_k > 0:
-            _set_eager_attention(self.model, self.backbone)
+        self._ensure_attention_capture_ready()
         return self
 
     def disable(self) -> None:
@@ -410,6 +446,7 @@ class FastVController:
                 if isinstance(self.config.scorer, str)
                 else getattr(self.config.scorer, "__name__", "custom")
             ),
+            "attn_captured": bool(attn_weights is not None),
             "mode": self.config.mode,
             "fastv_k": self.config.fastv_k,
             "fastv_r": self.config.effective_pruning_ratio(n_vis),
@@ -511,6 +548,7 @@ class FastVController:
 
         # 2. Backbone pre-hook to reset per-forward transient state.
         def _backbone_pre_hook(_module: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+            self._restore_temp_attn_impl()
             self._step_captured_attn = None
             self._step_keep_indices = None
             self._step_drop_indices = None
@@ -538,22 +576,32 @@ class FastVController:
         for layer_idx, decoder_layer in enumerate(self.backbone.layers):
             self_attn = self.adapter.get_layer_attention_module(decoder_layer)
             if self_attn is not None:
-                attn_sig_params = set(inspect.signature(self_attn.forward).parameters.keys())
-                has_output_attentions_arg = "output_attentions" in attn_sig_params
+                attn_sig = inspect.signature(self_attn.forward)
+                has_var_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in attn_sig.parameters.values()
+                )
+                can_pass_output_attentions = ("output_attentions" in attn_sig.parameters) or has_var_kw
+                can_dynamic_eager = _supports_dynamic_eager_dispatch(self_attn)
 
-                def _make_attn_pre_hook(idx: int, has_oa: bool):
-                    def _attn_pre_hook(_mod: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+                def _make_attn_pre_hook(idx: int, can_oa: bool, dynamic_eager: bool):
+                    def _attn_pre_hook(mod: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
                         if (
                             self.config.use_fastv
                             and self.config.fastv_k > 0
                             and idx == self.config.fastv_k - 1
                             and self._step_orig_len is not None
                             and self._step_orig_len > 1
-                            and has_oa
                         ):
-                            new_kwargs = dict(kwargs)
-                            new_kwargs["output_attentions"] = True
-                            return args, new_kwargs
+                            if dynamic_eager:
+                                attn_cfg = getattr(mod, "config", None)
+                                prev_impl = getattr(attn_cfg, "_attn_implementation", None)
+                                if attn_cfg is not None and prev_impl != "eager":
+                                    self._step_prev_attn_impl = (attn_cfg, prev_impl)
+                                    attn_cfg._attn_implementation = "eager"
+                            if can_oa:
+                                new_kwargs = dict(kwargs)
+                                new_kwargs["output_attentions"] = True
+                                return args, new_kwargs
                         return None
 
                     return _attn_pre_hook
@@ -567,14 +615,17 @@ class FastVController:
                             and self._step_orig_len is not None
                             and self._step_orig_len > 1
                         ):
-                            if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
-                                self._step_captured_attn = output[1].detach()
+                            try:
+                                if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                                    self._step_captured_attn = output[1].detach()
+                            finally:
+                                self._restore_temp_attn_impl()
 
                     return _attn_post_hook
 
                 self._handles.append(
                     self_attn.register_forward_pre_hook(
-                        _make_attn_pre_hook(layer_idx, has_output_attentions_arg),
+                        _make_attn_pre_hook(layer_idx, can_pass_output_attentions, can_dynamic_eager),
                         with_kwargs=True,
                     )
                 )

@@ -25,13 +25,13 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from FastV.fastv_hf import (
+from FastV import (
     FastVConfig,
     compute_fastv_flops_ratio,
     compute_rouge_l,
-    load_llava_model,
-    prepare_llava_inputs,
-    resolve_hf_model_id,
+    load_vlm_model,
+    prepare_vlm_inputs,
+    resolve_handler,
 )
 
 CONTRACTIONS = {
@@ -166,7 +166,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=os.environ.get("FASTV_QUANTIZATION", "4bit"),
-        choices=["4bit", "8bit", "none"],
+        choices=["4bit", "8bit", "bf16", "fp16", "none"],
     )
     parser.add_argument("--max-examples", type=int, default=500, help="Number of OCR-VQA images (default: 500).")
     parser.add_argument("--max-questions", type=int, default=None, help="Optional cap on total QA pairs.")
@@ -187,8 +187,19 @@ def main() -> None:
     )
     print(f"Loaded {len(prompts)} OCR-VQA QA pairs.")
 
-    model_id = resolve_hf_model_id(pargs.model_path)
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    handler = resolve_handler(pargs.model_path)
+    model_id = handler.resolve_model_id(pargs.model_path)
+    if torch.cuda.is_available():
+        if pargs.quantization == "bf16" or (
+            handler.name == "qwen2_vl"
+            and pargs.quantization != "fp16"
+            and torch.cuda.is_bf16_supported()
+        ):
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+    else:
+        dtype = torch.float32
 
     if use_fastv:
         fastv_cfg = FastVConfig(
@@ -204,8 +215,9 @@ def main() -> None:
     else:
         fastv_cfg = FastVConfig(use_fastv=False)
 
-    model, processor, controller = load_llava_model(
+    model, processor, controller = load_vlm_model(
         model_id=model_id,
+        handler=handler,
         quantization=pargs.quantization,
         dtype=dtype,
         attn_implementation="eager",
@@ -214,11 +226,13 @@ def main() -> None:
     )
 
     device = next(model.parameters()).device
-    image_token_index = int(getattr(model.config, "image_token_index", 32000))
+    vis_ids = controller.adapter.get_visual_token_ids(model)
+    image_token_id = int(vis_ids[0]) if vis_ids else 32000
 
     outputs: list[str] = []
     latencies: list[float] = []
     prompt_lengths: list[int] = []
+    image_lengths: list[int] = []
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -226,17 +240,20 @@ def main() -> None:
     for idx, (prompt, image) in enumerate(
         tqdm(zip(prompts, images), total=len(prompts), desc="OCR-VQA")
     ):
-        inputs, _ = prepare_llava_inputs(
+        inputs, span = prepare_vlm_inputs(
             processor=processor,
             prompt=prompt,
             image=image,
             device=device,
             dtype=dtype,
+            handler=handler,
             include_system_prompt=pargs.include_system_prompt,
-            image_token_index=image_token_index,
+            image_token_index=image_token_id,
         )
         prompt_len = int(inputs["input_ids"].shape[1])
         prompt_lengths.append(prompt_len)
+        if span is not None:
+            image_lengths.append(int(span[1]))
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -272,7 +289,11 @@ def main() -> None:
     )
 
     text_cfg = getattr(model.config, "text_config", model.config)
-    img_len = fastv_cfg.image_token_length or 576
+    img_len = (
+        max(1, int(round(sum(image_lengths) / len(image_lengths))))
+        if image_lengths
+        else (fastv_cfg.image_token_length or 576)
+    )
     avg_text_len = max(1, int(round((sum(prompt_lengths) / max(1, len(prompt_lengths))) - img_len)))
     flops = compute_fastv_flops_ratio(
         num_layers=int(getattr(text_cfg, "num_hidden_layers", 32)),
@@ -282,6 +303,7 @@ def main() -> None:
         n_text_tokens=avg_text_len,
         hidden_size=int(getattr(text_cfg, "hidden_size", 4096)),
         intermediate_size=int(getattr(text_cfg, "intermediate_size", 11008)),
+        swiglu=(handler.name == "qwen2_vl"),
     )
 
     out_dir = os.path.dirname(os.path.abspath(pargs.output_path))
@@ -290,6 +312,8 @@ def main() -> None:
 
     result = {
         "model": model_id,
+        "handler": handler.name,
+        "adapter": controller.adapter.name,
         "quantization": pargs.quantization,
         "num_questions": len(outputs),
         "fastv_config": fastv_cfg.to_dict(),

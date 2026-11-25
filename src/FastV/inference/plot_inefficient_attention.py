@@ -35,12 +35,12 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from FastV.fastv_hf import (
+from FastV import (
     FastVConfig,
     compute_layer_attention_efficiency,
-    load_llava_model,
-    prepare_llava_inputs,
-    resolve_hf_model_id,
+    load_vlm_model,
+    prepare_vlm_inputs,
+    resolve_handler,
 )
 
 
@@ -173,7 +173,7 @@ def plot_attention_grid(
         ax.axis("off")
 
     fig.suptitle(
-        "Inefficient Visual Attention Across LLaVA Layers (Red lines mark image tokens)",
+        "Inefficient Visual Attention Across Layers (Red lines mark image tokens)",
         fontsize=13,
         fontweight="bold",
         y=1.02,
@@ -189,7 +189,7 @@ def plot_attention_efficiency(metrics: dict, output_path: str) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5), dpi=180)
 
     ax1.plot(layers, metrics["system_total"], marker="o", markersize=3, label="System Prompt Tokens")
-    ax1.plot(layers, metrics["image_total"], marker="s", markersize=3, label="Image Tokens (576)")
+    ax1.plot(layers, metrics["image_total"], marker="s", markersize=3, label="Image Tokens")
     ax1.plot(layers, metrics["text_total"], marker="^", markersize=3, label="Text / Instruction Tokens")
     if any(v > 0 for v in metrics["output_total"]):
         ax1.plot(layers, metrics["output_total"], marker="d", markersize=3, label="Output Tokens")
@@ -236,14 +236,14 @@ def main() -> None:
         "--quantization",
         type=str,
         default=os.environ.get("FASTV_QUANTIZATION", "4bit"),
-        choices=["4bit", "8bit", "none"],
+        choices=["4bit", "8bit", "bf16", "fp16", "none"],
     )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument(
         "--include-system-prompt",
         action="store_true",
         default=True,
-        help="Include Vicuna v1 system prompt to match the original paper's 35-token system prefix.",
+        help="Include system prompt prefix.",
     )
     parser.add_argument(
         "--skip-individual-maps",
@@ -253,12 +253,27 @@ def main() -> None:
     )
     pargs = parser.parse_args()
 
-    model_id = resolve_hf_model_id(pargs.model_path)
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    handler = resolve_handler(pargs.model_path)
+    model_id = handler.resolve_model_id(pargs.model_path)
+    if torch.cuda.is_available():
+        if pargs.quantization == "bf16" or (
+            handler.name == "qwen2_vl"
+            and pargs.quantization != "fp16"
+            and torch.cuda.is_bf16_supported()
+        ):
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+    else:
+        dtype = torch.float32
 
-    print(f"Loading {model_id} (quantization={pargs.quantization}) for attention visualization...")
-    model, processor, controller = load_llava_model(
+    print(
+        f"Loading {model_id} via {handler.name} (quantization={pargs.quantization}, dtype={dtype}) "
+        "for attention visualization..."
+    )
+    model, processor, controller = load_vlm_model(
         model_id=model_id,
+        handler=handler,
         quantization=pargs.quantization,
         dtype=dtype,
         attn_implementation="eager",
@@ -268,18 +283,20 @@ def main() -> None:
     controller.disable()
 
     device = next(model.parameters()).device
-    image_token_index = int(getattr(model.config, "image_token_index", 32000))
+    vis_ids = controller.adapter.get_visual_token_ids(model)
+    image_token_id = int(vis_ids[0]) if vis_ids else 32000
     image = load_image(pargs.image_path)
 
     # 1. Generate response without FastV.
-    inputs, span = prepare_llava_inputs(
+    inputs, span = prepare_vlm_inputs(
         processor=processor,
         prompt=pargs.prompt,
         image=image,
         device=device,
         dtype=dtype,
+        handler=handler,
         include_system_prompt=pargs.include_system_prompt,
-        image_token_index=image_token_index,
+        image_token_index=image_token_id,
     )
     prompt_len = int(inputs["input_ids"].shape[1])
     img_start, img_len = span if span else (35, 576)
@@ -298,15 +315,17 @@ def main() -> None:
     print(f"Generated output:\n{model_output_ori}\n")
 
     # 2. Single teacher-forced forward pass over prompt + generated output to extract full layer attentions.
-    full_inputs, _ = prepare_llava_inputs(
+    output_prefix = "" if handler.name == "qwen2_vl" else " "
+    full_inputs, _ = prepare_vlm_inputs(
         processor=processor,
         prompt=pargs.prompt,
         image=image,
         device=device,
         dtype=dtype,
+        handler=handler,
         include_system_prompt=pargs.include_system_prompt,
-        append_output=" " + model_output_ori,
-        image_token_index=image_token_index,
+        append_output=output_prefix + model_output_ori,
+        image_token_index=image_token_id,
     )
     with torch.inference_mode():
         fwd_out = model(

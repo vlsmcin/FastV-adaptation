@@ -6,12 +6,12 @@ Tracks the planned follow-up work to migrate callers to `BaseVLMHandler` and mov
 
 ## 1. Migrate Callers to Model-Agnostic `BaseVLMHandler` & `FastV` Facade
 
-- [ ] **Update `executor.ipynb`**:
+- [x] **Update `executor.ipynb`** (and `executor_qwen.ipynb`):
   - Switch imports from `from FastV.fastv_hf import ...` to `from FastV import ...` (`FastVConfig`, `load_vlm_model`, `prepare_vlm_inputs`, `resolve_handler`, etc.).
-  - Replace `load_llava_model` / `prepare_llava_inputs` calls with `handler = resolve_handler(MODEL_ID)` → `handler.load_model(...)` and `handler.prepare_inputs(...)`.
+  - Replace `load_llava_model` / `prepare_llava_inputs` calls with `handler = resolve_handler(MODEL_ID)` → `load_vlm_model(...)` and `prepare_vlm_inputs(...)`.
   - Remove LLaVA-specific hardcoded assumptions: `image_token_index=32000` (read from `controller.adapter.get_visual_token_ids(model)`), fixed `576` visual token count (use per-sample detected `span[1]`), and fixed A-OKVQA `attention_rank` (`432, 288, 144, 72` → ratio-based `fastv_r=0.25, 0.50, 0.75, 0.875`).
   - Fix Cell 5 test command to `python -m unittest discover -s tests -p "test_*.py" -v`.
-- [ ] **Update CLI scripts** to import from `FastV` and use `resolve_handler(model_id)` + dynamic visual token lengths:
+- [x] **Update CLI scripts** to import from `FastV` and use `resolve_handler(model_id)` + dynamic visual token lengths:
   - `demo-hf.py`
   - `src/FastV/inference/plot_inefficient_attention.py`
   - `src/FastV/inference/eval/inference_aokvqa.py`

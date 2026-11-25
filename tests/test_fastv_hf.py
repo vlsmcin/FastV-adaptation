@@ -616,6 +616,108 @@ if HAS_TORCH:
             self.assertEqual(out_q["input_ids"].dtype, torch.long)
             self.assertEqual(out_q["image_grid_thw"].dtype, torch.long)
 
+        def test_qwen2_vl_dynamic_sdpa_to_eager_layer_k_minus_1_only(self) -> None:
+            from FastV.fastv_hf import _set_eager_attention
+
+            class _UnifiedQwenAttn(nn.Module):
+                """Mimics transformers 5.x Qwen2_5_VLAttention (**kwargs only, config-driven dispatch)."""
+
+                def __init__(self, layer_idx: int, shared_cfg: _DummyConfig, dim: int = 16, num_heads: int = 2):
+                    super().__init__()
+                    self.layer_idx = layer_idx
+                    self.config = shared_cfg
+                    self.dim = dim
+                    self.num_heads = num_heads
+                    self.seen_impls: list[str] = []
+                    self.seen_oa_flags: list[bool] = []
+
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    attention_mask: torch.Tensor | None = None,
+                    position_ids: torch.Tensor | None = None,
+                    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+                    past_key_values: _MockDynamicCache | None = None,
+                    **kwargs,
+                ):
+                    impl = self.config._attn_implementation
+                    self.seen_impls.append(impl)
+                    self.seen_oa_flags.append(bool(kwargs.get("output_attentions", False)))
+                    bsz, q_len, dim = hidden_states.shape
+                    if position_embeddings is not None:
+                        assert position_embeddings[0].shape[-2] == q_len
+                    scores = torch.matmul(hidden_states, hidden_states.transpose(-1, -2)) / (dim ** 0.5)
+                    scores = scores.unsqueeze(1).expand(bsz, self.num_heads, q_len, q_len)
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    out = torch.matmul(attn_weights.mean(dim=1), hidden_states)
+                    # Only eager returns materialized attention weights (SDPA returns None).
+                    return out, (attn_weights if impl == "eager" else None)
+
+            shared_text_cfg = _DummyConfig(num_layers=4, model_type="qwen2_5_vl", image_token_id=151655)
+            shared_text_cfg._attn_implementation = "sdpa"
+            vision_cfg = _DummyConfig(num_layers=2, model_type="qwen2_5_vl_vision")
+            vision_cfg._attn_implementation = "sdpa"
+
+            model = _DummyQwen2VLWrapper()
+            model._backbone_ref.config = shared_text_cfg
+            for i, layer in enumerate(model._backbone_ref.layers):
+                layer.self_attn = _UnifiedQwenAttn(i, shared_text_cfg)
+            model.visual = nn.Module()
+            model.visual.config = vision_cfg
+
+            ctrl = attach_fastv(model, FastVConfig(use_fastv=True, fastv_k=2, fastv_r=0.5, mode="inplace"))
+            # Global SDPA stays intact on both vision and text configs
+            self.assertEqual(model.visual.config._attn_implementation, "sdpa")
+            self.assertEqual(shared_text_cfg._attn_implementation, "sdpa")
+
+            input_ids = torch.tensor([[1, 2] + [151655] * 8 + [3, 4, 5, 6]])
+            embeds = torch.randn(1, 14, 16)
+            mask = torch.zeros(1, 1, 14, 14)
+            out = model(input_ids=input_ids, inputs_embeds=embeds, attention_mask=mask)
+
+            self.assertEqual(out.shape, (1, 10, 16))
+            self.assertTrue(ctrl.last_stats["attn_captured"])
+            # Only layer K-1 (idx=1) ran eager with output_attentions=True; all others stayed SDPA
+            self.assertEqual(model._backbone_ref.layers[0].self_attn.seen_impls, ["sdpa"])
+            self.assertEqual(model._backbone_ref.layers[1].self_attn.seen_impls, ["eager"])
+            self.assertEqual(model._backbone_ref.layers[1].self_attn.seen_oa_flags, [True])
+            self.assertEqual(model._backbone_ref.layers[2].self_attn.seen_impls, ["sdpa"])
+            self.assertEqual(model._backbone_ref.layers[3].self_attn.seen_impls, ["sdpa"])
+            # Config restored to sdpa after forward, and model.visual untouched
+            self.assertEqual(shared_text_cfg._attn_implementation, "sdpa")
+            self.assertEqual(model.visual.config._attn_implementation, "sdpa")
+
+            # Verify _set_eager_attention never mutates model.visual
+            _set_eager_attention(model, model._backbone_ref)
+            self.assertEqual(shared_text_cfg._attn_implementation, "eager")
+            self.assertEqual(model.visual.config._attn_implementation, "sdpa")
+
+        def test_quantization_bf16_precedence_over_fp16_dtype(self) -> None:
+            from unittest.mock import patch
+
+            captured = {}
+
+            class _FakeModelCls:
+                @classmethod
+                def from_pretrained(cls, model_id, **kwargs):
+                    captured.update(kwargs)
+                    m = nn.Linear(2, 2)
+                    return m
+
+            handler = Qwen2VLHandler()
+            with patch("torch.cuda.is_available", return_value=True):
+                handler._load_hf_model(
+                    model_cls=_FakeModelCls,
+                    model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+                    quantization="bf16",
+                    dtype=torch.float16,  # stale fp16 dtype must NOT override quantization="bf16"
+                    attn_implementation="sdpa",
+                    device_map=None,
+                )
+            loaded_dtype = captured.get("dtype", captured.get("torch_dtype"))
+            self.assertEqual(loaded_dtype, torch.bfloat16)
+            self.assertEqual(captured.get("attn_implementation"), "sdpa")
+
 
 if __name__ == "__main__":
     unittest.main()

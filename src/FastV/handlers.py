@@ -108,14 +108,15 @@ class BaseVLMHandler(ABC):
         from transformers import BitsAndBytesConfig
 
         quant = (quantization or "none").strip().lower()
-        if dtype is not None:
-            resolved_dtype = dtype
-        elif quant == "bf16":
+        # Explicit precision strings ('bf16'/'fp16'/'fp32') always take precedence over a stale dtype argument.
+        if quant == "bf16":
             resolved_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         elif quant == "fp32":
             resolved_dtype = torch.float32
         elif quant == "fp16":
             resolved_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        elif dtype is not None:
+            resolved_dtype = dtype
         else:
             resolved_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -166,11 +167,11 @@ class BaseVLMHandler(ABC):
 
     @staticmethod
     def _move_inputs_to_device(inputs: Dict[str, Any], device: Any, dtype: Any) -> Dict[str, Any]:
-        """Move processor outputs to ``device``, casting only floating-point tensors to ``dtype``."""
+        """Move processor outputs to ``device``, casting floating-point tensors to ``dtype`` when given."""
         out: Dict[str, Any] = {}
         for k, v in inputs.items():
             if torch is not None and torch.is_tensor(v):
-                if v.is_floating_point():
+                if v.is_floating_point() and dtype is not None:
                     out[k] = v.to(device=device, dtype=dtype)
                 else:
                     out[k] = v.to(device=device)
@@ -345,7 +346,7 @@ class Qwen2VLHandler(BaseVLMHandler):
         model_id: Optional[str] = None,
         quantization: str = "4bit",
         dtype: Optional[Any] = None,
-        attn_implementation: str = "eager",
+        attn_implementation: str = "sdpa",
         fastv_config: Optional[Union[FastVConfig, Dict[str, Any]]] = None,
         device_map: Optional[Any] = "auto",
         revision: Optional[str] = None,

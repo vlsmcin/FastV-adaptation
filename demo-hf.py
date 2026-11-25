@@ -23,12 +23,12 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from FastV.fastv_hf import (
+from FastV import (
     FastVConfig,
     compute_fastv_flops_ratio,
-    load_llava_model,
-    prepare_llava_inputs,
-    resolve_hf_model_id,
+    load_vlm_model,
+    prepare_vlm_inputs,
+    resolve_handler,
 )
 
 
@@ -106,8 +106,8 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=os.environ.get("FASTV_QUANTIZATION", "4bit"),
-        choices=["4bit", "8bit", "none"],
-        help="Quantization mode (default: 4bit).",
+        choices=["4bit", "8bit", "bf16", "fp16", "none"],
+        help="Quantization / precision mode (default: 4bit).",
     )
     parser.add_argument(
         "--image",
@@ -171,12 +171,23 @@ def main() -> None:
         if torch.cuda.is_available()
         else 0.0
     )
-    model_id = resolve_hf_model_id(
-        model_path=args.model_id,
+    handler = resolve_handler(args.model_id)
+    model_id = handler.resolve_model_id(
+        model_id=args.model_id,
         requested_size=os.environ.get("FASTV_MODEL_SIZE", ""),
         gpu_memory_gib=gpu_memory_gib,
     )
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    if torch.cuda.is_available():
+        if args.quantization == "bf16" or (
+            handler.name == "qwen2_vl"
+            and args.quantization != "fp16"
+            and torch.cuda.is_bf16_supported()
+        ):
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+    else:
+        dtype = torch.float32
     use_cache = not args.no_cache
 
     fastv_config = FastVConfig(
@@ -187,9 +198,13 @@ def main() -> None:
         scorer=args.scorer,
     )
 
-    print(f"Loading model: {model_id} (quantization={args.quantization}, GPU={gpu_memory_gib:.2f} GiB)")
-    model, processor, controller = load_llava_model(
+    print(
+        f"Loading model: {model_id} (handler={handler.name}, quantization={args.quantization}, "
+        f"dtype={dtype}, GPU={gpu_memory_gib:.2f} GiB)"
+    )
+    model, processor, controller = load_vlm_model(
         model_id=model_id,
+        handler=handler,
         quantization=args.quantization,
         dtype=dtype,
         attn_implementation="eager",
@@ -199,13 +214,16 @@ def main() -> None:
 
     raw_image = load_image(args.image)
     device = next(model.parameters()).device
-    inputs, image_span = prepare_llava_inputs(
+    vis_ids = controller.adapter.get_visual_token_ids(model)
+    image_token_id = int(vis_ids[0]) if vis_ids else 32000
+    inputs, image_span = prepare_vlm_inputs(
         processor=processor,
         prompt=args.prompt,
         image=raw_image,
         device=device,
         dtype=dtype,
-        image_token_index=int(getattr(model.config, "image_token_index", 32000)),
+        handler=handler,
+        image_token_index=image_token_id,
     )
 
     text_cfg = getattr(model.config, "text_config", model.config)
@@ -223,6 +241,7 @@ def main() -> None:
         n_text_tokens=text_len,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        swiglu=(handler.name == "qwen2_vl"),
     )
 
     baseline_res = None
