@@ -11,19 +11,15 @@ from __future__ import annotations
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 try:
     import torch
 except ImportError:  # pragma: no cover - allows pure-Python utilities without torch
     torch = None  # type: ignore[assignment]
 
-from .fastv_hf import (
-    FastVConfig,
-    FastVController,
-    attach_fastv,
-    detect_image_token_span,
-)
+if TYPE_CHECKING:  # pragma: no cover
+    from .fastv_hf import FastVConfig, FastVController
 
 VICUNA_SYSTEM_PROMPT = (
     "A chat between a curious human and an artificial intelligence assistant. "
@@ -250,6 +246,8 @@ class LlavaHandler(BaseVLMHandler):
             proc_kwargs["revision"] = revision
         processor = AutoProcessor.from_pretrained(resolved_id, **proc_kwargs)
 
+        from .fastv_hf import attach_fastv
+
         controller = attach_fastv(model, fastv_config)
         return model, processor, controller
 
@@ -290,6 +288,8 @@ class LlavaHandler(BaseVLMHandler):
         rgb_image = image.convert("RGB") if hasattr(image, "convert") else image
         inputs = processor(images=rgb_image, text=formatted, return_tensors="pt")
         out = self._move_inputs_to_device(inputs, device=device, dtype=dtype)
+        from .fastv_hf import detect_image_token_span
+
         span = detect_image_token_span(out.get("input_ids"), image_token_index=image_token_index)
         return out, span
 
@@ -388,6 +388,8 @@ class Qwen2VLHandler(BaseVLMHandler):
             proc_kwargs.pop("max_pixels", None)
             processor = AutoProcessor.from_pretrained(resolved_id, **proc_kwargs)
 
+        from .fastv_hf import attach_fastv
+
         controller = attach_fastv(model, fastv_config)
         return model, processor, controller
 
@@ -484,6 +486,8 @@ class Qwen2VLHandler(BaseVLMHandler):
         if vis_token_id is None:
             vis_token_id = 151655
 
+        from .fastv_hf import detect_image_token_span
+
         span = detect_image_token_span(
             out.get("input_ids"),
             image_token_index=int(vis_token_id),
@@ -529,6 +533,18 @@ def load_vlm_model(
     return resolved_handler.load_model(model_id=model_id, **kwargs)
 
 
+def format_vlm_prompt(
+    prompt: str,
+    processor: Optional[Any] = None,
+    model_id: Optional[str] = None,
+    handler: Optional[BaseVLMHandler] = None,
+    **kwargs: Any,
+) -> str:
+    """Format a user prompt using the auto-resolved ``BaseVLMHandler``."""
+    resolved_handler = resolve_handler(model_id=model_id, handler=handler)
+    return resolved_handler.format_prompt(prompt=prompt, processor=processor, **kwargs)
+
+
 def prepare_vlm_inputs(
     processor: Any,
     prompt: str,
@@ -562,6 +578,7 @@ __all__ = [
     "LlavaHandler",
     "Qwen2VLHandler",
     "VICUNA_SYSTEM_PROMPT",
+    "format_vlm_prompt",
     "load_vlm_model",
     "prepare_vlm_inputs",
     "register_handler",

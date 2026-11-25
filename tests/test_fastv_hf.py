@@ -24,7 +24,22 @@ from FastV.fastv_hf import (
     detect_image_token_span,
     detect_visual_token_indices,
     format_llava_prompt,
+    format_vlm_prompt,
+    load_vlm_model,
+    prepare_llava_inputs,
+    prepare_vlm_inputs,
+    resolve_handler,
     resolve_hf_model_id,
+)
+from FastV.handlers import (
+    HANDLERS,
+    BaseVLMHandler,
+    DEFAULT_QWEN2_VL_MODEL,
+    LlavaHandler,
+    Qwen2VLHandler,
+    load_vlm_model as handlers_load_vlm_model,
+    prepare_vlm_inputs as handlers_prepare_vlm_inputs,
+    register_handler,
 )
 from FastV.scoring import SCORERS, register_scorer, resolve_scorer
 
@@ -139,6 +154,78 @@ class TestFastVPurePython(unittest.TestCase):
         self.assertEqual(resolve_hf_model_id("llava-hf/llava-1.5-7b-hf"), "llava-hf/llava-1.5-7b-hf")
         formatted = format_llava_prompt("Describe this.", include_system_prompt=False)
         self.assertIn("USER: <image>\nDescribe this.\nASSISTANT:", formatted)
+
+    def test_abstract_base_handler_contract(self) -> None:
+        with self.assertRaises(TypeError):
+            BaseVLMHandler()  # type: ignore[abstract]
+
+    def test_handler_auto_resolution_and_registry(self) -> None:
+        self.assertIsInstance(resolve_handler("Qwen/Qwen2.5-VL-7B-Instruct"), Qwen2VLHandler)
+        self.assertIsInstance(resolve_handler("Qwen/Qwen2-VL-7B-Instruct"), Qwen2VLHandler)
+        self.assertIsInstance(resolve_handler("llava-hf/llava-1.5-7b-hf"), LlavaHandler)
+        self.assertIsInstance(resolve_handler(None), LlavaHandler)
+        self.assertEqual(Qwen2VLHandler().resolve_model_id(None), DEFAULT_QWEN2_VL_MODEL)
+        self.assertEqual(Qwen2VLHandler().resolve_model_id("qwen2-vl-7b"), "Qwen/Qwen2-VL-7B-Instruct")
+
+        class _DummyCustomHandler(BaseVLMHandler):
+            name = "dummy_custom"
+
+            @classmethod
+            def matches(cls, model_id):
+                return bool(model_id and "dummy-vlm" in model_id.lower())
+
+            def load_model(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def format_prompt(self, prompt, *args, **kwargs):
+                return prompt
+
+            def prepare_inputs(self, *args, **kwargs):
+                raise NotImplementedError
+
+        register_handler(_DummyCustomHandler)
+        try:
+            self.assertIsInstance(resolve_handler("org/dummy-vlm-7b"), _DummyCustomHandler)
+        finally:
+            HANDLERS.remove(_DummyCustomHandler)
+
+    def test_llava_and_qwen2_vl_prompt_formatting(self) -> None:
+        llava = LlavaHandler()
+        p_sys = llava.format_prompt("What is this?", include_system_prompt=True, append_output=" A cat.")
+        self.assertIn("A chat between a curious human", p_sys)
+        self.assertTrue(p_sys.endswith("USER: <image>\nWhat is this?\nASSISTANT: A cat."))
+        # Pre-formatted prompt passes through cleanly
+        pre = "USER: <image>\nHello\nASSISTANT:"
+        self.assertEqual(llava.format_prompt(pre, append_output=" Hi"), pre + " Hi")
+
+        qwen = Qwen2VLHandler()
+        # Pure-Python ChatML fallback (processor=None)
+        q_fallback = qwen.format_prompt("Describe.", include_system_prompt=True, append_output=" Nice")
+        self.assertIn("<|im_start|>system\nYou are a helpful assistant.<|im_end|>", q_fallback)
+        self.assertIn("<|vision_start|><|image_pad|><|vision_end|>Describe.", q_fallback)
+        self.assertTrue(q_fallback.endswith("<|im_start|>assistant\n Nice"))
+
+        # With mock processor implementing apply_chat_template
+        class _MockQwenProcessor:
+            def __init__(self):
+                self.seen_messages = None
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                self.seen_messages = messages
+                return "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe.<|im_end|>\n<|im_start|>assistant\n"
+
+        mock_proc = _MockQwenProcessor()
+        q_rendered = qwen.format_prompt("Describe.", processor=mock_proc, append_output=" Done")
+        self.assertEqual(mock_proc.seen_messages[-1]["role"], "user")
+        self.assertEqual(mock_proc.seen_messages[-1]["content"][0], {"type": "image"})
+        self.assertTrue(q_rendered.endswith("<|im_start|>assistant\n Done"))
+        # Verify direct re-exports from FastV.fastv_hf match FastV.handlers
+        self.assertIs(load_vlm_model, handlers_load_vlm_model)
+        self.assertIs(prepare_vlm_inputs, handlers_prepare_vlm_inputs)
+        self.assertIn(
+            "<|vision_start|><|image_pad|><|vision_end|>Hi",
+            format_vlm_prompt("Hi", model_id="Qwen/Qwen2.5-VL-7B-Instruct"),
+        )
 
 
 if HAS_TORCH:
@@ -466,6 +553,68 @@ if HAS_TORCH:
             self.assertEqual(res["layer"], [1, 2])
             self.assertAlmostEqual(res["image_total"][0], 12.0 / 20.0, places=5)
             self.assertAlmostEqual(res["visual_attention_efficiency"][0], 1.0, places=5)
+
+        def test_handlers_prepare_inputs_and_legacy_wrapper(self) -> None:
+            class _FakeImage:
+                def __init__(self):
+                    self.converted_to = None
+
+                def convert(self, mode):
+                    self.converted_to = mode
+                    return self
+
+            class _MockLlavaProc:
+                def __call__(self, images=None, text=None, return_tensors="pt"):
+                    return {
+                        "input_ids": torch.tensor([[1, 2, 32000, 32000, 32000, 3]], dtype=torch.long),
+                        "pixel_values": torch.ones((1, 3, 4, 4), dtype=torch.float32),
+                    }
+
+            class _MockQwenTok:
+                def convert_tokens_to_ids(self, tok):
+                    return 151655 if tok == "<|image_pad|>" else -1
+
+            class _MockQwenProc:
+                def __init__(self):
+                    self.tokenizer = _MockQwenTok()
+
+                def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                    return "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Hi<|im_end|>\n<|im_start|>assistant\n"
+
+                def __call__(self, text=None, images=None, padding=True, return_tensors="pt"):
+                    return {
+                        "input_ids": torch.tensor([[10, 151655, 151655, 151655, 151655, 20]], dtype=torch.long),
+                        "pixel_values": torch.ones((4, 16), dtype=torch.float32),
+                        "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+                    }
+
+            img_l = _FakeImage()
+            out_l, span_l = prepare_llava_inputs(
+                processor=_MockLlavaProc(),
+                prompt="Describe",
+                image=img_l,
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+            )
+            self.assertEqual(img_l.converted_to, "RGB")
+            self.assertEqual(span_l, (2, 3))
+            self.assertEqual(out_l["pixel_values"].dtype, torch.float16)
+            self.assertEqual(out_l["input_ids"].dtype, torch.long)
+
+            img_q = _FakeImage()
+            out_q, span_q = prepare_vlm_inputs(
+                processor=_MockQwenProc(),
+                prompt="Describe",
+                image=img_q,
+                device=torch.device("cpu"),
+                dtype=torch.float16,
+                model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+            )
+            self.assertEqual(img_q.converted_to, "RGB")
+            self.assertEqual(span_q, (1, 4))
+            self.assertEqual(out_q["pixel_values"].dtype, torch.float16)
+            self.assertEqual(out_q["input_ids"].dtype, torch.long)
+            self.assertEqual(out_q["image_grid_thw"].dtype, torch.long)
 
 
 if __name__ == "__main__":

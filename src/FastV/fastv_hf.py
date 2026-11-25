@@ -31,6 +31,15 @@ except ImportError:  # pragma: no cover - allows pure-Python utilities without t
     torch = None  # type: ignore[assignment]
 
 from .adapters import BaseVLMAdapter, LlavaLlamaAdapter, resolve_adapter
+from .handlers import (
+    BaseVLMHandler,
+    LlavaHandler,
+    Qwen2VLHandler,
+    format_vlm_prompt,
+    load_vlm_model,
+    prepare_vlm_inputs,
+    resolve_handler,
+)
 from .scoring import ScorerFn, resolve_scorer
 
 VICUNA_SYSTEM_PROMPT = (
@@ -226,8 +235,6 @@ def resolve_hf_model_id(
     gpu_memory_gib: Optional[float] = None,
 ) -> str:
     """Resolve a local path, HF model id, or legacy LLaVA name to a usable model id."""
-    from .handlers import LlavaHandler
-
     return LlavaHandler().resolve_model_id(
         model_id=model_path,
         requested_size=requested_size,
@@ -751,8 +758,6 @@ def load_llava_model(
     revision: Optional[str] = None,
 ) -> Tuple[Any, Any, FastVController]:
     """Load HF ``LlavaForConditionalGeneration`` + ``AutoProcessor`` (delegates to ``LlavaHandler``)."""
-    from .handlers import LlavaHandler
-
     return LlavaHandler().load_model(
         model_id=model_id,
         quantization=quantization,
@@ -770,8 +775,6 @@ def format_llava_prompt(
     append_output: str = "",
 ) -> str:
     """Format a user prompt into LLaVA-1.5 conversation format (delegates to ``LlavaHandler``)."""
-    from .handlers import LlavaHandler
-
     return LlavaHandler().format_prompt(
         prompt,
         include_system_prompt=include_system_prompt,
@@ -790,8 +793,6 @@ def prepare_llava_inputs(
     image_token_index: int = 32000,
 ) -> Tuple[Dict[str, Any], Optional[Tuple[int, int]]]:
     """Tokenize and preprocess text + image for modern HF LLaVA (delegates to ``LlavaHandler``)."""
-    from .handlers import LlavaHandler
-
     return LlavaHandler().prepare_inputs(
         processor=processor,
         prompt=prompt,

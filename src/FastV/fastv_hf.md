@@ -197,9 +197,11 @@ Detaches all PyTorch hooks from `model` and deletes `model._fastv_controller`.
 
 ---
 
-## 6. Model Loading & Input Preparation (Backwards-Compatible Wrappers)
+## 6. Model Loading & Input Preparation (Handler Re-exports & LLaVA Wrappers)
 
-The model-family loading, prompt formatting, and input preparation implementations now live in [`handlers.py`](./handlers.py) (`BaseVLMHandler`, `LlavaHandler`, `Qwen2VLHandler`). The three LLaVA functions in `fastv_hf.py` remain as thin backwards-compatible wrappers delegating to `LlavaHandler`:
+The model-family loading, prompt formatting, and input preparation implementations live in [`handlers.py`](./handlers.py) (`BaseVLMHandler`, `LlavaHandler`, `Qwen2VLHandler`). `fastv_hf.py` directly re-exports `BaseVLMHandler`, `LlavaHandler`, `Qwen2VLHandler`, `resolve_handler`, `load_vlm_model`, `format_vlm_prompt`, and `prepare_vlm_inputs` from `.handlers` so callers can import them from `FastV.fastv_hf` alongside `FastVConfig`.
+
+The three legacy LLaVA functions remain as thin backwards-compatible wrappers delegating to `LlavaHandler`:
 
 ### `load_llava_model(model_id=None, quantization="4bit", dtype=None, attn_implementation="eager", fastv_config=None, device_map="auto", revision=None) -> Tuple[model, processor, controller]`
 Delegates to `LlavaHandler().load_model(...)` in [`handlers.py`](./handlers.py), loading HuggingFace `LlavaForConditionalGeneration` + `AutoProcessor` (with 4-bit/8-bit/fp16 support and `transformers >= 4.56` `dtype` fallback) and attaching `FastVController`.
