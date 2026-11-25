@@ -198,9 +198,9 @@ def detect_visual_token_indices(
     positions = [idx for idx, tok in enumerate(tokens) if int(tok) in target_set]
     if not positions:
         return None
-    if len(positions) == 1 and default_image_length > 1:
+    if len(positions) == 1 and default_image_length > 1: # Older versions from transformers save just one placeholder token
         start = positions[0]
-        return list(range(start, start + int(default_image_length)))
+        return list(range(start, start + int(default_image_length))) # Depends on the model's configuration 
     return positions
 
 
@@ -217,7 +217,7 @@ def detect_image_token_span(
     )
     if not indices:
         return None
-    return (indices[0], len(indices))
+    return (indices[0], len(indices)) # Backwards-compatible wrapper dor detect_visual_token_indices
 
 
 def resolve_hf_model_id(
@@ -226,29 +226,13 @@ def resolve_hf_model_id(
     gpu_memory_gib: Optional[float] = None,
 ) -> str:
     """Resolve a local path, HF model id, or legacy LLaVA name to a usable model id."""
-    if model_path:
-        if os.path.exists(model_path):
-            return model_path
-        lower = model_path.lower().rstrip("/")
-        if "/" in model_path and not model_path.startswith(".") and not model_path.startswith("/"):
-            return model_path
-        if "13b" in lower:
-            return DEFAULT_HF_MODEL_13B
-        if "7b" in lower:
-            return DEFAULT_HF_MODEL_7B
-        return model_path
+    from .handlers import LlavaHandler
 
-    size = (requested_size or os.environ.get("FASTV_MODEL_SIZE", "")).strip().lower()
-    if size == "7b":
-        return DEFAULT_HF_MODEL_7B
-    if size == "13b":
-        return DEFAULT_HF_MODEL_13B
-
-    if gpu_memory_gib is None and torch is not None and torch.cuda.is_available():
-        gpu_memory_gib = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    if gpu_memory_gib is not None and gpu_memory_gib >= 24.0:
-        return DEFAULT_HF_MODEL_13B
-    return DEFAULT_HF_MODEL_7B
+    return LlavaHandler().resolve_model_id(
+        model_id=model_path,
+        requested_size=requested_size,
+        gpu_memory_gib=gpu_memory_gib,
+    )
 
 
 def get_llama_backbone(model: Any) -> Any:
@@ -766,67 +750,18 @@ def load_llava_model(
     device_map: Optional[Any] = "auto",
     revision: Optional[str] = None,
 ) -> Tuple[Any, Any, FastVController]:
-    """Load HF ``LlavaForConditionalGeneration`` + ``AutoProcessor`` cleanly across transformers 4.45-5.x."""
-    if torch is None:
-        raise RuntimeError("PyTorch is required to load LLaVA models.")
-    from transformers import AutoProcessor, BitsAndBytesConfig, LlavaForConditionalGeneration
+    """Load HF ``LlavaForConditionalGeneration`` + ``AutoProcessor`` (delegates to ``LlavaHandler``)."""
+    from .handlers import LlavaHandler
 
-    resolved_id = resolve_hf_model_id(model_id)
-    if dtype is None:
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-    quant = (quantization or "none").strip().lower()
-    quant_config = None
-    if quant == "4bit":
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_use_double_quant=True,
-        )
-    elif quant == "8bit":
-        quant_config = BitsAndBytesConfig(load_in_8bit=True)
-    elif quant not in ("none", "fp16", "bf16", "fp32"):
-        raise ValueError(f"Unsupported quantization={quantization!r}; choose '4bit', '8bit', or 'none'")
-
-    load_kwargs: Dict[str, Any] = {
-        "low_cpu_mem_usage": True,
-        "attn_implementation": attn_implementation,
-    }
-    if revision:
-        load_kwargs["revision"] = revision
-    if quant_config is not None:
-        load_kwargs["quantization_config"] = quant_config
-        load_kwargs["device_map"] = device_map if device_map is not None else {"": "cuda:0"}
-    elif torch.cuda.is_available():
-        load_kwargs["device_map"] = device_map if device_map is not None else {"": "cuda:0"}
-
-    import transformers
-
-    tf_ver = tuple(int(p) for p in re.findall(r"\d+", transformers.__version__)[:2])
-    if tf_ver >= (4, 56):
-        load_kwargs["dtype"] = dtype
-    else:
-        load_kwargs["torch_dtype"] = dtype
-
-    try:
-        model = LlavaForConditionalGeneration.from_pretrained(resolved_id, **load_kwargs)
-    except TypeError:
-        if "dtype" in load_kwargs:
-            load_kwargs["torch_dtype"] = load_kwargs.pop("dtype")
-        else:
-            load_kwargs["dtype"] = load_kwargs.pop("torch_dtype")
-        model = LlavaForConditionalGeneration.from_pretrained(resolved_id, **load_kwargs)
-
-    model.eval()
-
-    proc_kwargs: Dict[str, Any] = {}
-    if revision:
-        proc_kwargs["revision"] = revision
-    processor = AutoProcessor.from_pretrained(resolved_id, **proc_kwargs)
-
-    controller = attach_fastv(model, fastv_config)
-    return model, processor, controller
+    return LlavaHandler().load_model(
+        model_id=model_id,
+        quantization=quantization,
+        dtype=dtype,
+        attn_implementation=attn_implementation,
+        fastv_config=fastv_config,
+        device_map=device_map,
+        revision=revision,
+    )
 
 
 def format_llava_prompt(
@@ -834,12 +769,14 @@ def format_llava_prompt(
     include_system_prompt: bool = False,
     append_output: str = "",
 ) -> str:
-    """Format a user prompt into LLaVA-1.5 conversation format."""
-    if "<image>" in prompt and "ASSISTANT:" in prompt:
-        return prompt + append_output
-    prefix = f"{VICUNA_SYSTEM_PROMPT} " if include_system_prompt else ""
-    user_turn = prompt if "<image>" in prompt else f"<image>\n{prompt}"
-    return f"{prefix}USER: {user_turn}\nASSISTANT:{append_output}"
+    """Format a user prompt into LLaVA-1.5 conversation format (delegates to ``LlavaHandler``)."""
+    from .handlers import LlavaHandler
+
+    return LlavaHandler().format_prompt(
+        prompt,
+        include_system_prompt=include_system_prompt,
+        append_output=append_output,
+    )
 
 
 def prepare_llava_inputs(
@@ -852,25 +789,19 @@ def prepare_llava_inputs(
     append_output: str = "",
     image_token_index: int = 32000,
 ) -> Tuple[Dict[str, Any], Optional[Tuple[int, int]]]:
-    """Tokenize and preprocess text + image for modern HF LLaVA, returning ``(inputs, image_span)``."""
-    formatted = format_llava_prompt(
-        prompt,
+    """Tokenize and preprocess text + image for modern HF LLaVA (delegates to ``LlavaHandler``)."""
+    from .handlers import LlavaHandler
+
+    return LlavaHandler().prepare_inputs(
+        processor=processor,
+        prompt=prompt,
+        image=image,
+        device=device,
+        dtype=dtype,
         include_system_prompt=include_system_prompt,
         append_output=append_output,
+        image_token_index=image_token_index,
     )
-    rgb_image = image.convert("RGB") if hasattr(image, "convert") else image
-    inputs = processor(images=rgb_image, text=formatted, return_tensors="pt")
-    out: Dict[str, Any] = {}
-    for k, v in inputs.items():
-        if torch is not None and torch.is_tensor(v):
-            if v.is_floating_point():
-                out[k] = v.to(device=device, dtype=dtype)
-            else:
-                out[k] = v.to(device=device)
-        else:
-            out[k] = v
-    span = detect_image_token_span(out.get("input_ids"), image_token_index=image_token_index)
-    return out, span
 
 
 def compute_layer_attention_efficiency(

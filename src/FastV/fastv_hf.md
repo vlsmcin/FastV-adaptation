@@ -197,20 +197,18 @@ Detaches all PyTorch hooks from `model` and deletes `model._fastv_controller`.
 
 ---
 
-## 6. Model Loading & Input Preparation
+## 6. Model Loading & Input Preparation (Backwards-Compatible Wrappers)
 
-### `load_llava_model(model_id=None, quantization="4bit", dtype=None, attn_implementation="eager", fastv_config=None, device_map="auto", revision=None) -> Tuple[model, processor, controller]` (L760–829)
-Loads HuggingFace `LlavaForConditionalGeneration` + `AutoProcessor` and attaches FastV cleanly across `transformers` 4.45–5.x:
-- Resolves `model_id` via `resolve_hf_model_id`.
-- Supports `"4bit"` (NF4 with double quantization via `BitsAndBytesConfig`), `"8bit"`, or `"none"`/`"fp16"`/`"bf16"`/`"fp32"`.
-- Handles the `transformers >= 4.56` `dtype` vs. legacy `torch_dtype` keyword transition automatically (with a `TypeError` fallback).
-- Sets `model.eval()`, loads `AutoProcessor`, calls `attach_fastv(model, fastv_config)`, and returns `(model, processor, controller)`.
+The model-family loading, prompt formatting, and input preparation implementations now live in [`handlers.py`](./handlers.py) (`BaseVLMHandler`, `LlavaHandler`, `Qwen2VLHandler`). The three LLaVA functions in `fastv_hf.py` remain as thin backwards-compatible wrappers delegating to `LlavaHandler`:
 
-### `format_llava_prompt(prompt, include_system_prompt=False, append_output="") -> str` (L832–842)
-Formats a raw user prompt into LLaVA-1.5 conversation format (`[VICUNA_SYSTEM_PROMPT ]USER: <image>\n{prompt}\nASSISTANT:{append_output}`). If `<image>` and `ASSISTANT:` are already present, simply appends `append_output`.
+### `load_llava_model(model_id=None, quantization="4bit", dtype=None, attn_implementation="eager", fastv_config=None, device_map="auto", revision=None) -> Tuple[model, processor, controller]`
+Delegates to `LlavaHandler().load_model(...)` in [`handlers.py`](./handlers.py), loading HuggingFace `LlavaForConditionalGeneration` + `AutoProcessor` (with 4-bit/8-bit/fp16 support and `transformers >= 4.56` `dtype` fallback) and attaching `FastVController`.
 
-### `prepare_llava_inputs(processor, prompt, image, device, dtype, include_system_prompt=False, append_output="", image_token_index=32000) -> Tuple[Dict[str, Any], Optional[Tuple[int, int]]]` (L845–873)
-Formats the prompt, converts `image` to RGB, runs `processor(images=..., text=..., return_tensors="pt")`, moves floating-point tensors to `(device, dtype)` and integer tensors to `device`, detects the image token span via `detect_image_token_span`, and returns `(inputs_dict, image_span)`.
+### `format_llava_prompt(prompt, include_system_prompt=False, append_output="") -> str`
+Delegates to `LlavaHandler().format_prompt(...)`, formatting a raw user prompt into LLaVA-1.5 conversation format (`[VICUNA_SYSTEM_PROMPT ]USER: <image>\n{prompt}\nASSISTANT:{append_output}`).
+
+### `prepare_llava_inputs(processor, prompt, image, device, dtype, include_system_prompt=False, append_output="", image_token_index=32000) -> Tuple[Dict[str, Any], Optional[Tuple[int, int]]]`
+Delegates to `LlavaHandler().prepare_inputs(...)`, formatting the prompt, converting `image` to RGB, running `processor(...)`, moving tensors to `(device, dtype)`, and returning `(inputs_dict, image_span)`.
 
 ---
 
