@@ -40,7 +40,7 @@ from .handlers import (
     prepare_vlm_inputs,
     resolve_handler,
 )
-from .scoring import ScorerFn, resolve_scorer
+from .scoring import ScorerFn, resolve_scorer, score_visual_tokens
 
 VICUNA_SYSTEM_PROMPT = (
     "A chat between a curious human and an artificial intelligence assistant. "
@@ -403,6 +403,7 @@ class FastVController:
         seq_len: int,
         device: Any,
         attn_weights: Optional[Any],
+        hidden_states: Optional[Any] = None,
     ) -> Optional[Tuple[Any, Any]]:
         vis_indices = self._resolve_vis_indices(seq_len=seq_len, device=device)
         if vis_indices is None or vis_indices.numel() == 0:
@@ -415,14 +416,28 @@ class FastVController:
 
         if keep_n >= n_vis:
             kept_vis_indices = vis_indices
-        elif self.config.fastv_k == 0 or attn_weights is None:
+        elif self.config.fastv_k == 0:
             rng = random.Random(self.config.random_seed)
             rel = sorted(rng.sample(range(n_vis), keep_n)) if keep_n > 0 else []
             kept_vis_indices = vis_indices[torch.tensor(rel, dtype=torch.long, device=device)] if rel else torch.empty(0, dtype=torch.long, device=device)
         else:
-            scorer_fn = resolve_scorer(self.config.scorer)
-            scores = scorer_fn(attn_weights, vis_indices, **self.config.scorer_kwargs)
-            if keep_n > 0:
+            scores = None
+            if attn_weights is not None or hidden_states is not None:
+                try:
+                    scores = score_visual_tokens(
+                        self.config.scorer,
+                        attn_weights,
+                        vis_indices,
+                        hidden_states=hidden_states,
+                        **self.config.scorer_kwargs,
+                    )
+                except ValueError:
+                    scores = None
+            if scores is None:
+                rng = random.Random(self.config.random_seed)
+                rel = sorted(rng.sample(range(n_vis), keep_n)) if keep_n > 0 else []
+                kept_vis_indices = vis_indices[torch.tensor(rel, dtype=torch.long, device=device)] if rel else torch.empty(0, dtype=torch.long, device=device)
+            elif keep_n > 0:
                 top_rel = scores.topk(keep_n).indices.to(vis_indices.device)
                 kept_vis_indices = vis_indices.index_select(0, top_rel)
             else:
@@ -656,6 +671,7 @@ class FastVController:
                                 seq_len=orig_len,
                                 device=device,
                                 attn_weights=self._step_captured_attn,
+                                hidden_states=hidden_states.detach(),
                             )
                             self._step_captured_attn = None
                             if selection is None:

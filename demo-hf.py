@@ -8,6 +8,7 @@ KV-cache pruning, and optional side-by-side Vanilla vs FastV comparison.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -146,6 +147,12 @@ def parse_args() -> argparse.Namespace:
         default="fastv_mean",
         help="Visual token importance scorer from FastV.scoring.SCORERS (default: fastv_mean).",
     )
+    parser.add_argument(
+        "--scorer-kwargs",
+        type=str,
+        default="{}",
+        help="Optional JSON dict of keyword arguments passed to the scorer (e.g. weights/norm).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--min-new-tokens", type=int, default=200)
     parser.add_argument(
@@ -190,12 +197,14 @@ def main() -> None:
         dtype = torch.float32
     use_cache = not args.no_cache
 
+    scorer_kwargs = json.loads(args.scorer_kwargs) if args.scorer_kwargs else {}
     fastv_config = FastVConfig(
         use_fastv=True,
         fastv_k=args.fastv_k,
         fastv_r=args.fastv_r,
         mode=args.mode,
         scorer=args.scorer,
+        scorer_kwargs=scorer_kwargs,
     )
 
     print(

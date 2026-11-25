@@ -157,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         help="Visual token importance scorer from FastV.scoring.SCORERS (default: fastv_mean).",
     )
     parser.add_argument(
+        "--scorer-kwargs",
+        type=str,
+        default="{}",
+        help="Optional JSON dict of keyword arguments passed to the scorer.",
+    )
+    parser.add_argument(
         "--include-system-prompt",
         default=False,
         action="store_true",
@@ -202,12 +208,14 @@ def main() -> None:
         dtype = torch.float32
 
     if use_fastv:
+        scorer_kwargs = json.loads(pargs.scorer_kwargs) if pargs.scorer_kwargs else {}
         fastv_cfg = FastVConfig(
             use_fastv=True,
             fastv_k=pargs.fast_v_agg_layer,
             fastv_r=pargs.fast_v_r if pargs.fast_v_r is not None else 0.5,
             mode=pargs.fast_v_mode,
             scorer=pargs.scorer,
+            scorer_kwargs=scorer_kwargs,
             image_token_start_index=pargs.fast_v_sys_length,
             image_token_length=pargs.fast_v_image_token_length,
             attention_rank=pargs.fast_v_attention_rank,

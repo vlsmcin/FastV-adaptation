@@ -136,14 +136,14 @@ Returns a 1D `torch.long` tensor of visual token positions within `[0, seq_len)`
 - Uses manual `config.image_token_start_index` + `image_token_length` (or `default_image_length`) if explicitly configured.
 - Otherwise uses `self._detected_vis_indices` captured by `_top_pre_hook` (filtered to `< seq_len` and optionally truncated to `image_token_length`).
 
-#### `FastVController._select_keep_and_drop_indices(self, seq_len, device, attn_weights) -> Optional[Tuple[Tensor, Tensor]]` (L374–432)
+#### `FastVController._select_keep_and_drop_indices(self, seq_len, device, attn_weights, hidden_states=None) -> Optional[Tuple[Tensor, Tensor]]`
 Core token-selection algorithm executed at layer `K` during prefill:
 1. Resolves visual token positions via `_resolve_vis_indices` and computes `keep_n = config.resolve_keep_count(n_vis)`.
 2. Short-circuits (`return None`) if `keep_n >= n_vis` and `not force_slice_at_r0`.
 3. Selects which visual tokens survive:
    - `keep_n >= n_vis` → keeps all visual tokens.
-   - `fastv_k == 0` or `attn_weights is None` → deterministic random subset seeded by `config.random_seed`.
-   - Otherwise → resolves `scorer_fn = resolve_scorer(config.scorer)`, scores each visual token using `attn_weights`, and picks `scores.topk(keep_n)`.
+   - `fastv_k == 0` → deterministic random subset seeded by `config.random_seed`.
+   - Otherwise → invokes `score_visual_tokens(config.scorer, attn_weights, vis_indices, hidden_states=hidden_states, **config.scorer_kwargs)` (supporting attention-based, representation-norm, and normalized linear-combination scorers in `scoring.py`, with seeded random fallback if required tensors are unavailable) and picks `scores.topk(keep_n)`.
 4. Combines all non-visual token indices with `kept_vis_indices`, sorts them to preserve original sequence order (`keep_indices`), and computes the complement (`drop_indices`).
 5. Records telemetry in `self.last_stats` (adapter, scorer, mode, `K`, effective `R`, kept/dropped counts, original vs. pruned sequence length).
 6. Returns `(keep_indices, drop_indices)`.

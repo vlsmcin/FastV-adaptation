@@ -41,7 +41,22 @@ from FastV.handlers import (
     prepare_vlm_inputs as handlers_prepare_vlm_inputs,
     register_handler,
 )
-from FastV.scoring import SCORERS, register_scorer, resolve_scorer
+from FastV.scoring import (
+    SCORERS,
+    VALID_NORMALIZATIONS,
+    entropy_weighted_scorer,
+    fastv_max_head_scorer,
+    fastv_mean_scorer,
+    fastv_mean_std_scorer,
+    hidden_norm_scorer,
+    linear_combination_scorer,
+    make_combined_scorer,
+    normalize_scores,
+    register_scorer,
+    resolve_scorer,
+    score_visual_tokens,
+    text_query_mean_scorer,
+)
 
 try:
     import torch
@@ -115,13 +130,42 @@ class TestFastVPurePython(unittest.TestCase):
             FastVConfig(scorer="nonexistent_scorer")
 
     def test_scorer_registry(self) -> None:
-        self.assertIn("fastv_mean", SCORERS)
-        self.assertIn("fastv_max_head", SCORERS)
-        self.assertIn("fastv_mean_std", SCORERS)
+        expected = {
+            "fastv_mean",
+            "fastv_max_head",
+            "fastv_mean_std",
+            "text_query_mean",
+            "entropy_weighted",
+            "hidden_norm",
+            "combo_mean_text",
+            "combo_attn_ensemble",
+            "combo_mean_text_norm",
+            "combo_mean_text_norm_minmax",
+            "linear_combination",
+        }
+        self.assertTrue(expected.issubset(set(SCORERS.keys())))
+        self.assertEqual(VALID_NORMALIZATIONS, ("zscore", "minmax", "rank", "none"))
+
         custom = lambda attn, vis, **kw: vis
         register_scorer("test_dummy_scorer", custom)
         self.assertIs(resolve_scorer("test_dummy_scorer"), custom)
         SCORERS.pop("test_dummy_scorer", None)
+
+        # Strict 2-arg custom scorer must work with score_visual_tokens even when hidden_states is passed
+        strict_two_arg = lambda attn, vis: (attn, vis)
+        self.assertEqual(score_visual_tokens(strict_two_arg, "a", "v", hidden_states="h", extra=1), ("a", "v"))
+
+        # Validation of missing required inputs & invalid combination specs
+        with self.assertRaises(ValueError):
+            fastv_mean_scorer(None, [0, 1])
+        with self.assertRaises(ValueError):
+            hidden_norm_scorer(None, [0, 1], hidden_states=None)
+        with self.assertRaises(ValueError):
+            make_combined_scorer({}, norm="zscore")
+        with self.assertRaises(ValueError):
+            make_combined_scorer({"fastv_mean": 1.0}, norm="invalid_norm")
+        with self.assertRaises(TypeError):
+            make_combined_scorer("fastv_mean")  # type: ignore[arg-type]
 
     def test_adapter_auto_resolution(self) -> None:
         class _FakeCfg:
@@ -553,6 +597,103 @@ if HAS_TORCH:
             self.assertEqual(res["layer"], [1, 2])
             self.assertAlmostEqual(res["image_total"][0], 12.0 / 20.0, places=5)
             self.assertAlmostEqual(res["visual_attention_efficiency"][0], 1.0, places=5)
+
+        def test_new_scorers_normalization_and_linear_combinations(self) -> None:
+            # Sequence of 8 tokens: [0, 1] system, [2, 3, 4, 5] visual, [6, 7] instruction text
+            vis_indices = torch.tensor([2, 3, 4, 5], dtype=torch.long)
+            attn = torch.full((1, 2, 8, 8), 0.05, dtype=torch.float32)
+
+            # Last query token (idx 7): head 0 is uniform over visual tokens, head 1 focuses sharply on token 4
+            attn[0, 0, 7, 2:6] = torch.tensor([0.20, 0.20, 0.20, 0.20])
+            attn[0, 1, 7, 2:6] = torch.tensor([0.01, 0.01, 0.77, 0.01])
+
+            # Earlier question token (idx 6): strongly attends to visual token 2 on both heads
+            attn[0, :, 6, 2:6] = torch.tensor([0.85, 0.02, 0.02, 0.02])
+
+            # Hidden states entering layer K: visual token 5 has huge L2 norm (100x scale mismatch vs attn)
+            hs = torch.ones((1, 8, 4), dtype=torch.float32)
+            hs[0, 5, :] = 50.0  # L2 norm = 100.0
+
+            s_mean = fastv_mean_scorer(attn, vis_indices)
+            s_max = fastv_max_head_scorer(attn, vis_indices)
+            s_mstd = fastv_mean_std_scorer(attn, vis_indices, alpha=0.5)
+            s_text = text_query_mean_scorer(attn, vis_indices)
+            s_ent = entropy_weighted_scorer(attn, vis_indices)
+            s_norm = hidden_norm_scorer(None, vis_indices, hidden_states=hs)
+
+            self.assertEqual(int(s_mean.argmax().item()), 2)  # rel idx 2 -> seq token 4
+            self.assertEqual(int(s_max.argmax().item()), 2)
+            self.assertEqual(int(s_mstd.argmax().item()), 2)
+            self.assertEqual(int(s_text.argmax().item()), 0)  # rel idx 0 -> seq token 2 (from query 6)
+            self.assertEqual(int(s_norm.argmax().item()), 3)  # rel idx 3 -> seq token 5 (from hidden_norm)
+
+            # Entropy-weighted must weight sharp head 1 much higher than uniform head 0 on rel idx 2
+            self.assertGreater(float(s_ent[2].item()), float(s_mean[2].item()))
+
+            # Normalization checks (zscore, minmax, rank, and constant-score safety)
+            z = normalize_scores(torch.tensor([10.0, 20.0, 30.0, 40.0]), method="zscore")
+            self.assertAlmostEqual(float(z.mean().item()), 0.0, places=5)
+            self.assertAlmostEqual(float(z.std(unbiased=False).item()), 1.0, places=5)
+
+            mm = normalize_scores(torch.tensor([10.0, 20.0, 30.0, 50.0]), method="minmax")
+            self.assertAlmostEqual(float(mm.min().item()), 0.0, places=5)
+            self.assertAlmostEqual(float(mm.max().item()), 1.0, places=5)
+
+            rk = normalize_scores(torch.tensor([100.0, -5.0, 20.0, 50.0]), method="rank")
+            self.assertTrue(torch.allclose(rk, torch.tensor([1.0, 0.0, 1.0 / 3.0, 2.0 / 3.0]), atol=1e-5))
+
+            const_vec = torch.tensor([7.0, 7.0, 7.0, 7.0])
+            self.assertTrue(torch.equal(normalize_scores(const_vec, "zscore"), torch.zeros(4)))
+            self.assertTrue(torch.equal(normalize_scores(const_vec, "minmax"), torch.zeros(4)))
+
+            # Normalized linear combination balances tiny attn (~0.5) and large hidden_norm (~100.0)
+            combo_z = SCORERS["combo_mean_text_norm"](attn, vis_indices, hidden_states=hs)
+            combo_mm = SCORERS["combo_mean_text_norm_minmax"](attn, vis_indices, hidden_states=hs)
+            self.assertEqual(combo_z.shape, (4,))
+            self.assertEqual(combo_mm.shape, (4,))
+            # Top-3 kept tokens under 3-way fusion should be the 3 distinct winners {0, 2, 3}, dropping uninformative rel idx 1!
+            self.assertEqual(set(combo_z.topk(3).indices.tolist()), {0, 2, 3})
+            self.assertEqual(set(combo_mm.topk(3).indices.tolist()), {0, 2, 3})
+
+            # Dynamic linear_combination via FastVController hooks
+            model = _DummyLlavaWrapper(nested_v5=True)
+            input_ids = torch.tensor([[1, 2] + [32000] * 8 + [4, 5]])
+            embeds = torch.randn(1, 12, 16)
+            causal_mask = torch.zeros(1, 1, 12, 12)
+            for scorer_name in (
+                "text_query_mean",
+                "entropy_weighted",
+                "hidden_norm",
+                "combo_attn_ensemble",
+                "combo_mean_text_norm",
+                "combo_mean_text_norm_minmax",
+            ):
+                ctrl = attach_fastv(
+                    model,
+                    FastVConfig(use_fastv=True, fastv_k=2, fastv_r=0.5, mode="inplace", scorer=scorer_name),
+                )
+                out = model(input_ids=input_ids, inputs_embeds=embeds, attention_mask=causal_mask)
+                self.assertEqual(out.shape, (1, 8, 16))
+                self.assertEqual(ctrl.last_stats["scorer"], scorer_name)
+                self.assertEqual(ctrl.last_stats["kept_image_tokens"], 4)
+
+            ctrl_custom = attach_fastv(
+                model,
+                FastVConfig(
+                    use_fastv=True,
+                    fastv_k=2,
+                    fastv_r=0.5,
+                    mode="inplace",
+                    scorer="linear_combination",
+                    scorer_kwargs={
+                        "weights": {"fastv_mean": 0.6, "hidden_norm": 0.4},
+                        "norm": "minmax",
+                    },
+                ),
+            )
+            out_custom = model(input_ids=input_ids, inputs_embeds=embeds, attention_mask=causal_mask)
+            self.assertEqual(out_custom.shape, (1, 8, 16))
+            self.assertEqual(ctrl_custom.last_stats["scorer"], "linear_combination")
 
         def test_handlers_prepare_inputs_and_legacy_wrapper(self) -> None:
             class _FakeImage:
