@@ -107,13 +107,18 @@ class BaseVLMHandler(ABC):
         import transformers
         from transformers import BitsAndBytesConfig
 
-        resolved_dtype = (
-            dtype
-            if dtype is not None
-            else (torch.float16 if torch.cuda.is_available() else torch.float32)
-        )
-
         quant = (quantization or "none").strip().lower()
+        if dtype is not None:
+            resolved_dtype = dtype
+        elif quant == "bf16":
+            resolved_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        elif quant == "fp32":
+            resolved_dtype = torch.float32
+        elif quant == "fp16":
+            resolved_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        else:
+            resolved_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
         quant_config = None
         if quant == "4bit":
             quant_config = BitsAndBytesConfig(
@@ -361,6 +366,12 @@ class Qwen2VLHandler(BaseVLMHandler):
             if model_cls is None:
                 model_cls = getattr(transformers, "Qwen2VLForConditionalGeneration")
 
+        # Qwen2-VL / Qwen2.5-VL are natively trained in bfloat16 and can overflow float16.
+        if dtype is None and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            q = (quantization or "none").strip().lower()
+            if q not in ("fp16", "fp32"):
+                dtype = torch.bfloat16
+
         model = self._load_hf_model(
             model_cls=model_cls,
             model_id=resolved_id,
@@ -376,14 +387,25 @@ class Qwen2VLHandler(BaseVLMHandler):
             proc_kwargs["revision"] = revision
         min_pixels = kwargs.get("min_pixels", self.min_pixels)
         max_pixels = kwargs.get("max_pixels", self.max_pixels)
-        if min_pixels is not None:
-            proc_kwargs["min_pixels"] = min_pixels
-        if max_pixels is not None:
-            proc_kwargs["max_pixels"] = max_pixels
+        tf_ver = tuple(int(p) for p in re.findall(r"\d+", transformers.__version__)[:2])
+        if min_pixels is not None or max_pixels is not None:
+            if tf_ver >= (5, 0):
+                size_cfg: Dict[str, int] = {}
+                if min_pixels is not None:
+                    size_cfg["shortest_edge"] = int(min_pixels)
+                if max_pixels is not None:
+                    size_cfg["longest_edge"] = int(max_pixels)
+                proc_kwargs["size"] = size_cfg
+            else:
+                if min_pixels is not None:
+                    proc_kwargs["min_pixels"] = int(min_pixels)
+                if max_pixels is not None:
+                    proc_kwargs["max_pixels"] = int(max_pixels)
 
         try:
             processor = AutoProcessor.from_pretrained(resolved_id, **proc_kwargs)
         except TypeError:
+            proc_kwargs.pop("size", None)
             proc_kwargs.pop("min_pixels", None)
             proc_kwargs.pop("max_pixels", None)
             processor = AutoProcessor.from_pretrained(resolved_id, **proc_kwargs)

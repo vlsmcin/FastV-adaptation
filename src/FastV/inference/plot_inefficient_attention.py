@@ -71,12 +71,14 @@ def visualize_attention(
         .squeeze(0)
     )
 
+    pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1.0, neginf=0.0)
     cmap = plt.get_cmap("viridis")
     fig = plt.figure(figsize=(5, 5), dpi=250)
 
-    vmax = max(float(pooled.max().item()), 1e-3)
-    vmin = min(0.0007, vmax / 10.0)
-    log_norm = LogNorm(vmin=max(vmin, 1e-6), vmax=vmax)
+    raw_max = float(pooled.max().item()) if pooled.numel() > 0 else 0.0
+    vmax = raw_max if (raw_max > 1e-3 and raw_max == raw_max) else 1e-3
+    vmin = max(min(0.0007, vmax / 10.0), 1e-6)
+    log_norm = LogNorm(vmin=vmin, vmax=vmax)
 
     ax = sns.heatmap(pooled.numpy(), cmap=cmap, norm=log_norm)
 
@@ -148,12 +150,14 @@ def plot_attention_grid(
             .squeeze(0)
             .squeeze(0)
         )
-        vmax = max(float(pooled.max().item()), 1e-3)
-        vmin = min(0.0007, vmax / 10.0)
+        pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1.0, neginf=0.0)
+        raw_max = float(pooled.max().item()) if pooled.numel() > 0 else 0.0
+        vmax = raw_max if (raw_max > 1e-3 and raw_max == raw_max) else 1e-3
+        vmin = max(min(0.0007, vmax / 10.0), 1e-6)
         sns.heatmap(
             pooled.numpy(),
             cmap=cmap,
-            norm=LogNorm(vmin=max(vmin, 1e-6), vmax=vmax),
+            norm=LogNorm(vmin=vmin, vmax=vmax),
             ax=ax,
             cbar=False,
         )
