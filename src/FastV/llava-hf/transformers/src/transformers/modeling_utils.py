@@ -2551,9 +2551,15 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
     def to(self, *args, **kwargs):
         # Checks if the model has been loaded in 8-bit
         if getattr(self, "quantization_method", None) == QuantizationMethod.BITS_AND_BYTES:
+            dtype_in_args = any(isinstance(arg, torch.dtype) for arg in args)
+            dtype_in_kwargs = "dtype" in kwargs
+            if not dtype_in_args and not dtype_in_kwargs:
+                # Accelerate dispatch calls model.to(device) after loading.
+                # Move registered buffers as well as ordinary modules.
+                return super().to(*args, **kwargs)
             raise ValueError(
-                "`.to` is not supported for `4-bit` or `8-bit` bitsandbytes models. Please use the model as it is, since the"
-                " model has already been set to the correct devices and casted to the correct `dtype`."
+                "Casting a 4-bit or 8-bit bitsandbytes model with `.to(dtype=...)` is not supported. "
+                "Load the model with `torch_dtype` and use it without `.to()`."
             )
         elif getattr(self, "quantization_method", None) == QuantizationMethod.GPTQ:
             # For GPTQ models, we prevent users from casting the model to another dytpe to restrict unwanted behaviours.

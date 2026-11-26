@@ -1,42 +1,34 @@
-1. Clone the latest LLaVA repo
+# Using FastV with `lmms-eval` (Modern Transformers >=4.45 / 5.x)
+
+With the modernized hook-based `FastVController` (`src/FastV/fastv_hf.py`), you **no longer need to patch `modeling_llama.py` rotary embeddings or downgrade `transformers`**.
+
+## Quick Setup
+
+1. Install modern dependencies and `lmms-eval`:
 ```bash
-git clone https://github.com/haotian-liu/LLaVA.git
-cd LLaVA
+pip install -r requirements.txt
+pip install lmms-eval
 ```
 
-2. Install LLaVA
+2. Attach FastV to any HuggingFace LLaVA model inside `lmms-eval` (or your evaluation wrapper):
+```python
+from src.FastV.lmms-eval.fastv_kvcache import enable_fastv_for_lmms_eval  # or add src/FastV to PYTHONPATH
+# After loading LlavaForConditionalGeneration with attn_implementation="eager":
+enable_fastv_for_lmms_eval(model, k=3, r=0.5, mode="inplace")
+```
+
+3. Run `lmms-eval` benchmarks (e.g., `mme`, `gqa`, `mmmu_val`, `seedbench`, `nocaps`, `flickr30k`, `coco2017_cap_val`):
 ```bash
-conda create -n llava python=3.10 -y
-conda activate llava
-pip install --upgrade pip  # enable PEP 660 support
-pip install -e .
-```
-3. put `fastv_kvcache.py` under `llava/model/language_model/`
-
-4. replace `LlavaLlamaModel` from `llava/model/language_model/llava_llama.py` with following code:
-```python
-from .fastv_kvcache import FastVLlamaModel
-class LlavaLlamaModel(LlavaMetaModel, FastVLlamaModel): # Alter LlamaModel to  FastVLlamaModel
-    config_class = LlavaConfig
-
-    def __init__(self, config: LlamaConfig):
-        super(LlavaLlamaModel, self).__init__(config)
+accelerate launch --num_processes=1 -m lmms_eval \
+    --model llava_hf \
+    --model_args pretrained=llava-hf/llava-1.5-7b-hf,attn_implementation=eager \
+    --tasks mme,gqa,mmmu_val \
+    --batch_size 1 \
+    --output_path ./logs/
 ```
 
-HINT: You could change the K and R hyper-parameters of FastV in line 119 and 120.
-
-5. Go to your `transformers/src/transformers/models/llama/modeling_llama.py` in the conda envs, change **all three** 
-```python
-cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-```
-from different attention implementation, to
-
-```python
-cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max().item() + 1)
-```
-
-6. After finishing the steps ahead, the updated llava directly supports [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) repo for more convinent evaluation of fastv.
+See `executor.ipynb` Section 6 for a ready-to-run Colab evaluation pipeline covering MME (Perception & Cognition), GQA, MMMU, and optional `lmms-eval` execution.
 
 ## Acknowledgements
 
-Thanks [Zhihang Lin](https://github.com/Stardust1956) from Xiamen University for providing the code.
+Thanks to [Zhihang Lin](https://github.com/Stardust1956) from Xiamen University for the original KV-cache & `lmms-eval` integration.
